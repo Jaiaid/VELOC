@@ -4,16 +4,11 @@
 #include "backend/work_queue.hpp"
 
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <regex>
 #include <future>
 #include <queue>
-#include <vector>
-#include <cstring>
 
-#include <unistd.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 
@@ -55,6 +50,10 @@ client_impl_t::client_impl_t(unsigned int id, const std::string &cfg_file) :
     queue = new comm_client_t<command_t>(rank);
     run_blocking(command_t(rank, command_t::INIT, 0, ""));
     DBG("VELOC initialized");
+
+    // initiating the transfer engine to isolate allocation cost (at singleton instance first call) 
+    // from the actual checkpoint_mem or recover_mem
+    auto &instance = transfer_engine_t::instance(cfg);
 }
 
 client_impl_t::client_impl_t(MPI_Comm c, const std::string &cfg_file) :
@@ -77,6 +76,12 @@ client_impl_t::client_impl_t(MPI_Comm c, const std::string &cfg_file) :
     if (local != MPI_COMM_NULL)
         MPI_Barrier(local);
     DBG("VELOC initialized");
+
+    // initiating the transfer engine to isolate pinned memory allocation cost (done at singleton instance first call)
+    // GPU buffer will be initiated at the first call of mem_protect() with a device pointer, 
+    // which is the first time we know that GPU buffer is getting used
+    // from the actual checkpoint_mem or recover_mem
+    auto &instance = transfer_engine_t::instance(cfg);
 }
 
 client_impl_t::~client_impl_t() {
@@ -91,6 +96,7 @@ client_impl_t::~client_impl_t() {
 }
 
 bool client_impl_t::mem_protect(int id, void *ptr, size_t count, size_t base_size, const std::string &name) {
+    transfer_engine_t::instance(cfg).init_tier(ptr);
     return mem_regions[name].insert_or_assign(id, region_t(ptr, count * base_size)).second;
 }
 
@@ -248,9 +254,10 @@ bool client_impl_t::checkpoint_mem(int mode, const std::set<int> &ids) {
         current_ckpt_size += sizes[k];
     }
 
-    // Block only until the application's memory has been captured (device D2H
+    // Block only until the application's memory has been captured (device D2D/D2H
     // done, host writes done); staging->file writes continue in the background.
-    return current_group.wait_sources();
+    bool ok = current_group.wait_sources();
+    return ok;
 }
 
 bool client_impl_t::checkpoint_end(bool /*success*/) {
