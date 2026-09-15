@@ -59,23 +59,9 @@ struct xfer_group_impl_t {
 };
 
 struct transfer_engine_t::impl_t {
-    gpu_provider_t *gpu = nullptr;
-    size_t chunk = VELOC_XFER_CHUNK;
-
-    const config_t &cfg; // reference to the config object used to initialize different tiers of the transfer engine
-
-    std::vector<void *> slots_all;   // every allocated slot (for teardown)
-    std::vector<bool> slots_pinned;
-    std::vector<void *> free_slots;  // touched only by the worker thread
-
-    std::mutex mtx;
-    std::condition_variable app_cv;  // application waiters (wait_sources/wait_completion)
-    std::condition_variable work_cv; // progress thread
-    std::deque<std::shared_ptr<xfer_group_impl_t>> ready;
-    std::thread worker;
-    bool stop = false;
-
-    impl_t(const config_t &cfg) : cfg(cfg) {
+private:
+    void init_pinned_host_tier(const config_t &cfg)
+    {
         int num_host_stage_slots = VELOC_HOST_STAGE_SLOTS;
         cfg.get_optional<int>("host_stage_slots", num_host_stage_slots);
         INFO(
@@ -83,7 +69,6 @@ struct transfer_engine_t::impl_t {
             chunk << std::endl
         );
 
-        gpu = create_gpu_provider();
         for (int i = 0; i < num_host_stage_slots; i++) {
             void *s;
             bool pinned;
@@ -106,7 +91,28 @@ struct transfer_engine_t::impl_t {
             slots_pinned.push_back(pinned);
             free_slots.push_back(s);
         }
-        
+    }
+
+public:
+    gpu_provider_t *gpu = nullptr;
+    size_t chunk = VELOC_XFER_CHUNK;
+
+    const config_t &cfg; // reference to the config object used to initialize different tiers of the transfer engine
+
+    std::vector<void *> slots_all;   // every allocated slot (for teardown)
+    std::vector<bool> slots_pinned;
+    std::vector<void *> free_slots;  // touched only by the worker thread
+
+    std::mutex mtx;
+    std::condition_variable app_cv;  // application waiters (wait_sources/wait_completion)
+    std::condition_variable work_cv; // progress thread
+    std::deque<std::shared_ptr<xfer_group_impl_t>> ready;
+    std::thread worker;
+    bool stop = false;
+
+    impl_t(const config_t &cfg) : cfg(cfg) {
+        init_pinned_host_tier(cfg);
+        gpu = create_gpu_provider();
         worker = std::thread([this] { run(); });
     }
 
@@ -143,7 +149,7 @@ struct transfer_engine_t::impl_t {
         return K_HOST;
     }
 
-    void init_tier(void *ptr) {
+    void init_gpu_tier(void *ptr) {
         if (gpu == nullptr)
             return;
         if (classify(mem(ptr)) != K_DEVICE)
@@ -288,12 +294,11 @@ struct transfer_engine_t::impl_t {
                 continue;
             }
             // Both pools exhausted: flush the oldest pinned chunk to make room.
-            // if (pin_staged.empty()) {
-            //     ERROR("no staging slot available for device checkpoint");
-            //     fail(g);
-            //     break;
-            // }
-            drain_pin_to_file();
+            // We only free one pinned slot at a time, this is done so that iterations are faster 
+            // if the pinned pool is not full, and to avoid starving the device pool if it is full. 
+            if (free_slots.empty()) {
+                drain_pin_to_file();
+            }
         }
 
         // Flush remaining tiers to the file, oldest-first.
@@ -483,5 +488,5 @@ xfer_group_t transfer_engine_t::group() {
 }
 
 void transfer_engine_t::init_tier(void *ptr) {
-    pimpl->init_tier(ptr);
+    pimpl->init_gpu_tier(ptr);
 }
