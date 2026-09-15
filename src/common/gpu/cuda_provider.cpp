@@ -2,6 +2,9 @@
 
 #include <cuda_runtime.h>
 
+#include <mutex>
+#include <vector>
+
 //#define __DEBUG
 #include "common/debug.hpp"
 
@@ -11,21 +14,55 @@
 namespace {
 
 class cuda_provider_t : public gpu_provider_t {
+    std::vector<void *> device_slots_;
+    std::vector<void *> device_free_;
+    mutable std::mutex device_mtx_;
+    int gpu_id_ = 0;
+    int device_count_ = 0;
+
 public:
+    cuda_provider_t(int device_count_): device_count_(device_count_), gpu_provider_t() {
+
+    }
+
+    ~cuda_provider_t() override {
+        std::lock_guard<std::mutex> lk(device_mtx_);
+        for (void *p : device_slots_)
+            if (p != nullptr)
+                cudaFree(p);
+        device_slots_.clear();
+        device_free_.clear();
+    }
+
+    inline void get_pointer_attributes(const void *ptr, cudaPointerAttributes &attr) {
+        if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+            // Unregistered host allocations report an error on older runtimes;
+            // clear it and treat the pointer as host memory.
+            cudaGetLastError();
+            attr.type = cudaMemoryTypeHost;
+        }
+    }
+
     bool is_device(const void *ptr) override {
         if (ptr == nullptr)
             return false;
         cudaPointerAttributes attr;
-        cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
-        if (err != cudaSuccess) {
-            // Unregistered host allocations report an error on older runtimes;
-            // clear it and treat the pointer as host memory.
-            cudaGetLastError();
-            return false;
-        }
+        get_pointer_attributes(ptr, attr);
         // Managed (unified) memory is host-accessible, so we treat only plain
         // device memory as requiring a device-to-host staging copy.
         return attr.type == cudaMemoryTypeDevice;
+    }
+
+    int get_device_id(const void *ptr) override {
+        if (ptr == nullptr)
+            return -1;
+        
+        cudaPointerAttributes attr;
+        get_pointer_attributes(ptr, attr);
+        if (attr.type == cudaMemoryTypeDevice)
+            return attr.device;
+        else
+            return -1;
     }
 
     void *alloc_pinned(size_t size) override {
@@ -49,6 +86,80 @@ public:
     bool copy_h2d(void *dev_dst, const void *host_src, size_t size) override {
         return cudaMemcpy(dev_dst, host_src, size, cudaMemcpyHostToDevice) == cudaSuccess;
     }
+
+    bool init_device_buffer(size_t slot_size, int slots, int device_id) override {
+        {
+            std::lock_guard<std::mutex> lk(device_mtx_);
+            if (!device_slots_.empty())
+                return true; // already initialized
+            if (slots < 1 || slot_size == 0) {
+                DBG(
+                    "GPU buffer slot size and slot count must be > 1, got: slot count: " << 
+                    slots << ", slot size: " << slot_size << "B\n"
+                )
+                return false;
+            }
+        }
+
+        // get current device id to restore after init
+        cudaGetDevice(&gpu_id_);
+        if (cudaSetDevice(device_id) != cudaSuccess)
+            return false;
+
+        {
+            std::lock_guard<std::mutex> lk(device_mtx_);
+            
+            for (int i = 0; i < slots; i++) {
+                void *p = nullptr;
+                if (cudaMalloc(&p, slot_size) != cudaSuccess) {
+                    cudaGetLastError();
+                    for (void *q : device_slots_)
+                        if (q != nullptr)
+                            cudaFree(q);
+                    device_slots_.clear();
+                    device_free_.clear();
+                    return false;
+                }
+                device_slots_.push_back(p);
+                device_free_.push_back(p);
+            }
+        }
+        // Restore the original device ID for the process.
+        if (cudaSetDevice(gpu_id_) != cudaSuccess)
+            return false;
+
+        return true;
+    }
+
+    bool device_buffer_initialized() const override {
+        std::lock_guard<std::mutex> lk(device_mtx_);
+        return !device_slots_.empty();
+    }
+
+    void *acquire_device_slot() override {
+        std::lock_guard<std::mutex> lk(device_mtx_);
+        if (device_free_.empty())
+            return nullptr;
+        void *p = device_free_.back();
+        device_free_.pop_back();
+        return p;
+    }
+
+    void release_device_slot(void *ptr) override {
+        if (ptr == nullptr)
+            return;
+        std::lock_guard<std::mutex> lk(device_mtx_);
+        device_free_.push_back(ptr);
+    }
+
+    size_t free_device_slots() override {
+        std::lock_guard<std::mutex> lk(device_mtx_);
+        return device_free_.size();
+    }
+
+    bool copy_d2d(void *dst, const void *src, size_t size) override {
+        return cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice) == cudaSuccess;
+    }
 };
 
 } // anonymous namespace
@@ -61,5 +172,5 @@ gpu_provider_t *create_gpu_provider() {
         return nullptr;
     }
     INFO("CUDA GPU provider active (" << count << " device(s))");
-    return new cuda_provider_t();
+    return new cuda_provider_t(count);
 }
