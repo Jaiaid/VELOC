@@ -1,4 +1,5 @@
 #include "transfer_engine.hpp"
+#include "common/config.hpp"
 #include "file_provider.hpp"
 #include "common/gpu/gpu_provider.hpp"
 
@@ -18,10 +19,13 @@
 
 // Compile-time tunables (overridable via -D).
 #ifndef VELOC_XFER_CHUNK
-#define VELOC_XFER_CHUNK (8UL << 20)   // 8 MiB per staged chunk
+#define VELOC_XFER_CHUNK (64UL << 20)   // 64 MiB per staged chunk
 #endif
 #ifndef VELOC_GPU_STAGE_SLOTS
 #define VELOC_GPU_STAGE_SLOTS 8        // bounded pinned pool: SLOTS * CHUNK bytes
+#endif
+#ifndef VELOC_HOST_STAGE_SLOTS
+#define VELOC_HOST_STAGE_SLOTS 16        // bounded pinned pool: SLOTS * CHUNK bytes
 #endif
 
 // Fallback factory when no GPU support is compiled in: everything is host memory.
@@ -57,6 +61,9 @@ struct xfer_group_impl_t {
 struct transfer_engine_t::impl_t {
     gpu_provider_t *gpu = nullptr;
     size_t chunk = VELOC_XFER_CHUNK;
+
+    const config_t &cfg; // reference to the config object used to initialize different tiers of the transfer engine
+
     std::vector<void *> slots_all;   // every allocated slot (for teardown)
     std::vector<bool> slots_pinned;
     std::vector<void *> free_slots;  // touched only by the worker thread
@@ -68,22 +75,38 @@ struct transfer_engine_t::impl_t {
     std::thread worker;
     bool stop = false;
 
-    impl_t() {
+    impl_t(const config_t &cfg) : cfg(cfg) {
+        int num_host_stage_slots = VELOC_HOST_STAGE_SLOTS;
+        cfg.get_optional<int>("host_stage_slots", num_host_stage_slots);
+        INFO(
+            "Initiating host staging pool: " << num_host_stage_slots << " slots of " << 
+            chunk << std::endl
+        );
+
         gpu = create_gpu_provider();
-        if (gpu != nullptr) {
-            for (int i = 0; i < VELOC_GPU_STAGE_SLOTS; i++) {
-                void *s = gpu->alloc_pinned(chunk);
-                bool pinned = (s != nullptr);
+        for (int i = 0; i < num_host_stage_slots; i++) {
+            void *s;
+            bool pinned;
+            if (gpu != nullptr) {
+                s = gpu->alloc_pinned(chunk);
+                pinned = (s != nullptr);
                 if (s == nullptr)
                     s = ::malloc(chunk);
                 if (s == nullptr)
                     break;
-                slots_all.push_back(s);
-                slots_pinned.push_back(pinned);
-                free_slots.push_back(s);
             }
-            DBG("GPU staging pool: " << slots_all.size() << " slots of " << chunk << " bytes");
+            else {
+                s = ::malloc(chunk);
+                pinned = false;
+                if (s == nullptr)
+                    break;
+            }
+
+            slots_all.push_back(s);
+            slots_pinned.push_back(pinned);
+            free_slots.push_back(s);
         }
+        
         worker = std::thread([this] { run(); });
     }
 
@@ -104,12 +127,38 @@ struct transfer_engine_t::impl_t {
         delete gpu;
     }
 
+    int identify_memtier(const endpoint_t &e) {
+        if (e.fd >= 0)
+            return K_FILE;
+        if (gpu != nullptr && gpu->is_device(e.ptr))
+            return K_DEVICE;
+        return K_HOST;
+    }
+
     int classify(const endpoint_t &e) {
         if (e.fd >= 0)
             return K_FILE;
         if (gpu != nullptr && gpu->is_device(e.ptr))
             return K_DEVICE;
         return K_HOST;
+    }
+
+    void init_tier(void *ptr) {
+        if (gpu == nullptr)
+            return;
+        if (classify(mem(ptr)) != K_DEVICE)
+            return;
+        if (gpu->device_buffer_initialized())
+            return;
+        int num_gpu_stage_slots = VELOC_GPU_STAGE_SLOTS;
+        cfg.get_optional<int>("per-gpu_stage_slots", num_gpu_stage_slots);
+        int device_id = gpu->get_device_id(ptr);
+        INFO(
+            "Initiating device staging pool on GPU " << device_id << ": " << num_gpu_stage_slots <<
+            " slots of " << chunk << std::endl
+        );
+        if (!gpu->init_device_buffer(chunk, num_gpu_stage_slots, device_id))
+            ERROR("failed to initialize device staging buffer on GPU " << device_id);
     }
 
     void ensure_queued_locked(const std::shared_ptr<xfer_group_impl_t> &g) {
@@ -151,43 +200,123 @@ struct transfer_engine_t::impl_t {
     }
 
     void run_device_out(const std::shared_ptr<xfer_group_impl_t> &g, std::vector<dchunk_t> &chunks) {
-        // Greedy device->host staging: drain all D2H copies (releasing the
-        // application's device memory) as fast as the bounded pool allows; the
-        // host->file writes proceed in the background afterwards.
-        std::deque<std::pair<void *, dchunk_t>> staged;
-        for (auto &c : chunks) {
-            if (g->failed)
-                break;
-            while (free_slots.empty()) {
-                auto st = staged.front();
-                staged.pop_front();
-                if (!file_provider::write_range(st.second.fd, st.second.foff, st.first, st.second.n))
-                    fail(g);
-                else
-                    add_progress(g, 0, st.second.n);
-                free_slots.push_back(st.first);
-            }
-            void *slot = free_slots.back();
+        // Three-tier device->file drain. The application's device memory is
+        // first snapshotted with a fast D2D into the device staging pool; when
+        // that pool is full, the oldest device-staged chunk is evicted (D2H)
+        // into a pinned slot and the slot is reused; when the pinned pool is
+        // also full, the oldest pinned chunk is written to the file. This keeps
+        // the device pool "hot" (incoming chunks keep landing on-device) and
+        // guarantees the file is written in capture order, since pin_staged
+        // always holds strictly older data than dev_staged.
+        std::deque<std::pair<void *, dchunk_t>> dev_staged; // device slots holding app data
+        std::deque<std::pair<void *, dchunk_t>> pin_staged; // pinned slots awaiting file write
+
+        // Return every held slot to its pool (used on failure so later groups
+        // are not starved; data in these slots is not written to the file).
+        auto release_all = [&]() {
+            for (auto &p : dev_staged)
+                gpu->release_device_slot(p.first);
+            dev_staged.clear();
+            for (auto &p : pin_staged)
+                free_slots.push_back(p.first);
+            pin_staged.clear();
+        };
+
+        // Evict the oldest device-staged chunk into a free pinned slot. The
+        // device slot is released either way; returns false on copy failure.
+        auto move_dev_to_pin = [&]() -> bool {
+            void *pin = free_slots.back();
             free_slots.pop_back();
-            if (!gpu->copy_d2h(slot, c.dev, c.n)) {
+            void *dev = dev_staged.front().first;
+            if (!gpu->copy_d2h(pin, dev, dev_staged.front().second.n)) {
                 fail(g);
-                free_slots.push_back(slot);
+                gpu->release_device_slot(dev);
+                free_slots.push_back(pin);
+                dev_staged.pop_front();
+                return false;
+            }
+            pin_staged.push_back({pin, dev_staged.front().second});
+            gpu->release_device_slot(dev);
+            dev_staged.pop_front();
+            return true;
+        };
+
+        // Write the oldest pinned chunk to the file and return the slot.
+        auto drain_pin_to_file = [&]() {
+            void *pin = pin_staged.front().first;
+            const dchunk_t &c = pin_staged.front().second;
+            if (!file_provider::write_range(c.fd, c.foff, pin, c.n))
+                fail(g);
+            else
+                add_progress(g, 0, c.n);
+            free_slots.push_back(pin);
+            pin_staged.pop_front();
+        };
+
+        size_t i = 0;
+        while (i < chunks.size() && !g->failed) {
+            const dchunk_t &c = chunks[i];
+            void *devptr = gpu->acquire_device_slot();
+            if (devptr != nullptr) {
+                if (!gpu->copy_d2d(devptr, c.dev, c.n)) {
+                    fail(g);
+                    gpu->release_device_slot(devptr);
+                    break;
+                }
+                add_progress(g, c.n, 0); // application device memory released
+                dev_staged.push_back({devptr, c});
+                i++;
+                continue;
+            }
+            if (!dev_staged.empty() && !free_slots.empty()) {
+                if (!move_dev_to_pin()) // frees a device slot
+                    break;
+                continue; // stage into the freed device slot
+            }
+            if (!free_slots.empty()) {
+                // No device pool in use (init failed): stage into pinned.
+                void *pin = free_slots.back();
+                free_slots.pop_back();
+                if (!gpu->copy_d2h(pin, c.dev, c.n)) {
+                    fail(g);
+                    free_slots.push_back(pin);
+                    break;
+                }
+                add_progress(g, c.n, 0);
+                pin_staged.push_back({pin, c});
+                i++;
+                continue;
+            }
+            // Both pools exhausted: flush the oldest pinned chunk to make room.
+            // if (pin_staged.empty()) {
+            //     ERROR("no staging slot available for device checkpoint");
+            //     fail(g);
+            //     break;
+            // }
+            drain_pin_to_file();
+        }
+
+        // Flush remaining tiers to the file, oldest-first.
+        while (!g->failed) {
+            if (!dev_staged.empty()) {
+                if (free_slots.empty()) {
+                    if (pin_staged.empty()) {
+                        ERROR("no pinned slot available when flushing device staging");
+                        fail(g);
+                        break;
+                    }
+                    drain_pin_to_file();
+                } else if (!move_dev_to_pin()) {
+                    break;
+                }
+            } else if (!pin_staged.empty()) {
+                drain_pin_to_file();
+            } else {
                 break;
             }
-            add_progress(g, c.n, 0); // device source released
-            staged.emplace_back(slot, c);
         }
-        while (!staged.empty()) {
-            auto st = staged.front();
-            staged.pop_front();
-            if (!g->failed) {
-                if (!file_provider::write_range(st.second.fd, st.second.foff, st.first, st.second.n))
-                    fail(g);
-                else
-                    add_progress(g, 0, st.second.n);
-            }
-            free_slots.push_back(st.first);
-        }
+
+        release_all();
     }
 
     void process(const std::shared_ptr<xfer_group_impl_t> &g) {
@@ -339,7 +468,7 @@ void xfer_group_t::on_completion(std::function<void()> cont) {
 
 // ---- transfer_engine_t -----------------------------------------------------
 
-transfer_engine_t::transfer_engine_t(const config_t &) : pimpl(new impl_t()) { }
+transfer_engine_t::transfer_engine_t(const config_t &cfg) : pimpl(new impl_t(cfg)) { }
 transfer_engine_t::~transfer_engine_t() = default;
 
 transfer_engine_t &transfer_engine_t::instance(const config_t &cfg) {
@@ -351,4 +480,8 @@ xfer_group_t transfer_engine_t::group() {
     auto g = std::make_shared<xfer_group_impl_t>();
     g->eng = pimpl.get();
     return xfer_group_t(g);
+}
+
+void transfer_engine_t::init_tier(void *ptr) {
+    pimpl->init_tier(ptr);
 }

@@ -65,6 +65,9 @@ public:
     static transfer_engine_t &instance(const config_t &cfg);
     // Begin a new group of related transfers.
     xfer_group_t group();
+    // Classify ptr and, if it is a GPU device pointer, initialize the
+    // device-side staging buffer on the GPU owning it.
+    void init_tier(void *ptr);
 };
 
 #endif // __TRANSFER_ENGINE_HPP
