@@ -58,9 +58,9 @@ struct xfer_group_impl_t {
     }
 };
 
-struct transfer_engine_t::impl_t {
+class transfer_engine_t::impl_t {
 private:
-    void init_pinned_host_tier(const config_t &cfg)
+    void init_host_tier(const config_t &cfg)
     {
         int num_host_stage_slots = VELOC_HOST_STAGE_SLOTS;
         cfg.get_optional<int>("host_stage_slots", num_host_stage_slots);
@@ -111,7 +111,13 @@ public:
     bool stop = false;
 
     impl_t(const config_t &cfg) : cfg(cfg) {
-        init_pinned_host_tier(cfg);
+        // We assume that host tier is always available, so we create the host pool in constructor rather then deferring. 
+        // The GPU tier is optional and will be created only if GPU support is compiled in and a device pointer is seen.
+        // it can be pinned or unpinned depending on whether GPU support is available and pinned memory allocation succeeds.
+        init_host_tier(cfg);
+        // we create GPU provider but the buffer allocation at GPU tier is deferred until the first device pointer is seen, 
+        // so that we can choose the right device for multi-GPU systems
+        // also if not GPU build, create_gpu_provider() will return nullptr and the GPU tier will be disabled
         gpu = create_gpu_provider();
         worker = std::thread([this] { run(); });
     }
@@ -133,13 +139,6 @@ public:
         delete gpu;
     }
 
-    int identify_memtier(const endpoint_t &e) {
-        if (e.fd >= 0)
-            return K_FILE;
-        if (gpu != nullptr && gpu->is_device(e.ptr))
-            return K_DEVICE;
-        return K_HOST;
-    }
 
     int classify(const endpoint_t &e) {
         if (e.fd >= 0)
@@ -149,7 +148,11 @@ public:
         return K_HOST;
     }
 
-    void init_gpu_tier(void *ptr) {
+    // This method is kept public for deferred initialization of the GPU tier, since we need to know which device to use for multi-GPU systems.
+    // It is called from transfer_engine_t::init_tier() when a device pointer is seen for the first time.
+    // As we are using Pimpl Idiom pattern this is called inside transfer_engin_t::init_tier and needs to be public
+    // If the GPU tier is already initialized or not exist, this method does nothing.
+    void init_colocated_gpu_buffer(void *ptr) {
         if (gpu == nullptr)
             return;
         if (classify(mem(ptr)) != K_DEVICE)
@@ -488,5 +491,5 @@ xfer_group_t transfer_engine_t::group() {
 }
 
 void transfer_engine_t::init_tier(void *ptr) {
-    pimpl->init_gpu_tier(ptr);
+    pimpl->init_colocated_gpu_buffer(ptr);
 }
