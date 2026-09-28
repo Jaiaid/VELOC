@@ -4,11 +4,16 @@
 #include "backend/work_queue.hpp"
 
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <regex>
 #include <future>
 #include <queue>
+#include <vector>
+#include <cstring>
 
+#include <unistd.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 
