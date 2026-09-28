@@ -4,7 +4,12 @@ project(VELOC VERSION 1.8)
 ##### Global settings
 include(GNUInstallDirs)
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-add_compile_options(-O2 -g -Wall -Wextra -ffile-prefix-map=${CMAKE_SOURCE_DIR}/=)
+add_compile_options(-O2 -g -Wall -Wextra)
+#### To handle nvc++ unknown-swtch error
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-ffile-prefix-map=${CMAKE_SOURCE_DIR}/=)
+endif()
+
 add_definitions(-D__BENCHMARK -D__ASSERT -D__INFO)
 
 set(CMAKE_CXX_STANDARD 17)
