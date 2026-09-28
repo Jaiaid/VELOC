@@ -101,7 +101,7 @@ if __name__ == "__main__":
     cmake_args= ['-DCMAKE_INSTALL_PREFIX='+args.prefix,
                  '-DCMAKE_BUILD_TYPE='+cmake_build_type,
                  '-DCOMM_QUEUE='+args.protocol,
-                 '-DPOSIX_IO='+args.posix_io] + compiler_options + args.extra_cmake_args
+                 '-DFILE_IO='+args.posix_io] + compiler_options + args.extra_cmake_args
     # Configure
     print("CMake arguments: " + " ".join(cmake_args))
     ret = subprocess.call(['cmake'] + cmake_args + [os.getcwd()], cwd=veloc_build,)
