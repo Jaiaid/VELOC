@@ -1,0 +1,30 @@
+#!/bin/bash
+
+LIB_DIR=@CMAKE_INSTALL_FULL_LIBDIR@
+BIN_DIR=@CMAKE_INSTALL_FULL_BINDIR@
+TEST_DIR=@CMAKE_CURRENT_BINARY_DIR@
+SCRATCH=@CMAKE_TEST_SCRATCH@
+PERSISTENT=@CMAKE_TEST_PERSISTENT@
+META=@CMAKE_TEST_META@
+
+export LD_LIBRARY_PATH=$LIB_DIR:$LD_LIBRARY_PATH
+export VELOC_BIN=$BIN_DIR
+clean() { rm -rf $SCRATCH $PERSISTENT $META; mkdir -p $SCRATCH $PERSISTENT $META; }
+
+CFG=$TEST_DIR/gpu-sync.cfg
+SIZES=${SIZES:-"256 1024 4096"}
+ITERS=${ITERS:-5}
+RC=0
+
+echo "checkpoint_mem application stall (size MiB, memory type, avg/min/max seconds)"
+for TYPE in device host; do
+    for MIB in $SIZES; do
+        clean
+        OUT=$($TEST_DIR/test_ckpt_stall $CFG $TYPE $MIB $ITERS 2>&1) || { echo "$OUT"; echo "FAIL: $TYPE $MIB MiB"; RC=1; continue; }
+        echo "$OUT" | grep -E "ITER|SUMMARY"
+    done
+done
+
+rm -rf $SCRATCH $PERSISTENT $META
+[ $RC -eq 0 ] && echo "test_ckpt_stall: PASSED" || echo "test_ckpt_stall: FAILED"
+exit $RC

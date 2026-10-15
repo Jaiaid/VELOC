@@ -1,0 +1,5 @@
+scratch = @CMAKE_TEST_SCRATCH@
+persistent = @CMAKE_TEST_PERSISTENT@
+meta = @CMAKE_TEST_META@
+mode = async
+chksum = true

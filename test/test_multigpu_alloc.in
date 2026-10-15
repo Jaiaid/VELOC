@@ -1,0 +1,68 @@
+#!/bin/bash
+
+LIB_DIR=@CMAKE_INSTALL_FULL_LIBDIR@
+BIN_DIR=@CMAKE_INSTALL_FULL_BINDIR@
+TEST_DIR=@CMAKE_CURRENT_BINARY_DIR@
+SCRATCH=@CMAKE_TEST_SCRATCH@
+PERSISTENT=@CMAKE_TEST_PERSISTENT@
+META=@CMAKE_TEST_META@
+
+export LD_LIBRARY_PATH=$LIB_DIR:$LD_LIBRARY_PATH
+export VELOC_BIN=$BIN_DIR
+clean() { rm -rf $SCRATCH $PERSISTENT $META; mkdir -p $SCRATCH $PERSISTENT $META; }
+
+
+# prints "<pid> <gpu_index> <used_MiB>" for every compute process on every GPU
+smi_procs() {
+    nvidia-smi --query-gpu=index,uuid --format=csv,noheader | tr -d " " | while IFS=, read idx uuid; do
+        echo "$uuid $idx"
+    done > $WORK/uuid_map
+    nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits | tr -d " " | while IFS=, read pid uuid mem; do
+        idx=$(awk -v u="$uuid" '$1==u {print $2}' $WORK/uuid_map)
+        echo "$pid $idx $mem"
+    done
+}
+
+CFG=$TEST_DIR/gpu-sync.cfg
+WORK=$(mktemp -d)
+NGPU=$(nvidia-smi -L | wc -l)
+NP=${NP:-$NGPU}
+HOLD=${HOLD:-12}
+APP_MIB=${APP_MIB:-256}
+BUF_MIB=${BUF_MIB:-512}
+MIN_MIB=$((APP_MIB + BUF_MIB - 32))
+RC=0
+
+clean
+echo "=== $NP MPI ranks on $NGPU GPUs, rank r -> GPU r % $NGPU ==="
+mpirun $MPI_OPT -np $NP $TEST_DIR/test_multigpu_alloc $CFG $HOLD $APP_MIB > $WORK/out 2>&1 &
+MPI_PID=$!
+for i in $(seq 1 120); do
+    [ "$(grep -c READY $WORK/out)" -ge "$NP" ] && break
+    kill -0 $MPI_PID 2>/dev/null || break
+    sleep 0.5
+done
+if [ "$(grep -c READY $WORK/out)" -lt "$NP" ]; then
+    cat $WORK/out; echo "FAIL: not all ranks became ready"; wait $MPI_PID; exit 1
+fi
+sleep 1
+echo "--- nvidia-smi ---"; nvidia-smi
+smi_procs > $WORK/procs
+
+grep READY $WORK/out | sort -k2 -n | while read _ rank _ pid _ gpu _; do
+    ON_TARGET=$(awk -v p=$pid -v g=$gpu '$1==p && $2==g {print $3}' $WORK/procs)
+    ELSEWHERE=$(awk -v p=$pid -v g=$gpu '$1==p && $2!=g {print $2 ":" $3 "MiB"}' $WORK/procs)
+    echo "rank $rank pid $pid: ${ON_TARGET:-0} MiB on GPU $gpu (need >= $MIN_MIB), elsewhere: ${ELSEWHERE:-none}"
+    if [ -z "$ON_TARGET" ] || [ "$ON_TARGET" -lt "$MIN_MIB" ] || [ -n "$ELSEWHERE" ]; then
+        echo "FAIL: rank $rank is not confined to GPU $gpu"; echo 1 > $WORK/failed
+    fi
+done
+[ -f $WORK/failed ] && RC=1
+# a multi-GPU run must actually use more than one GPU
+USED=$(grep READY $WORK/out | awk '{print $6}' | sort -u | wc -l)
+if [ $NGPU -gt 1 ] && [ $NP -gt 1 ] && [ $USED -lt 2 ]; then echo "FAIL: only $USED GPU used"; RC=1; fi
+
+wait $MPI_PID || { echo "FAIL: MPI program exited with error"; cat $WORK/out; RC=1; }
+rm -rf $WORK $SCRATCH $PERSISTENT $META
+[ $RC -eq 0 ] && echo "test_multigpu_alloc: PASSED" || echo "test_multigpu_alloc: FAILED"
+exit $RC

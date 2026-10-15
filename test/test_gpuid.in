@@ -1,0 +1,62 @@
+#!/bin/bash
+
+LIB_DIR=@CMAKE_INSTALL_FULL_LIBDIR@
+BIN_DIR=@CMAKE_INSTALL_FULL_BINDIR@
+TEST_DIR=@CMAKE_CURRENT_BINARY_DIR@
+SCRATCH=@CMAKE_TEST_SCRATCH@
+PERSISTENT=@CMAKE_TEST_PERSISTENT@
+META=@CMAKE_TEST_META@
+
+export LD_LIBRARY_PATH=$LIB_DIR:$LD_LIBRARY_PATH
+export VELOC_BIN=$BIN_DIR
+clean() { rm -rf $SCRATCH $PERSISTENT $META; mkdir -p $SCRATCH $PERSISTENT $META; }
+
+
+# prints "<pid> <gpu_index> <used_MiB>" for every compute process on every GPU
+smi_procs() {
+    nvidia-smi --query-gpu=index,uuid --format=csv,noheader | tr -d " " | while IFS=, read idx uuid; do
+        echo "$uuid $idx"
+    done > $WORK/uuid_map
+    nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits | tr -d " " | while IFS=, read pid uuid mem; do
+        idx=$(awk -v u="$uuid" '$1==u {print $2}' $WORK/uuid_map)
+        echo "$pid $idx $mem"
+    done
+}
+
+CFG=$TEST_DIR/gpu-sync.cfg
+WORK=$(mktemp -d)
+NGPU=$(nvidia-smi -L | wc -l)
+HOLD=${HOLD:-12}
+APP_MIB=${APP_MIB:-256}
+# GPU buffer = per-gpu_stage_slots (8) * chunk (64 MiB) by default
+BUF_MIB=${BUF_MIB:-512}
+MIN_MIB=$((APP_MIB + BUF_MIB - 32))
+RC=0
+
+for GPU in $(seq 0 $((NGPU - 1))); do
+    clean
+    echo "=== app memory on GPU $GPU ==="
+    $TEST_DIR/test_gpuid $CFG $GPU $HOLD $APP_MIB > $WORK/out.$GPU 2>&1 &
+    PID=$!
+    for i in $(seq 1 60); do grep -q READY $WORK/out.$GPU && break; kill -0 $PID 2>/dev/null || break; sleep 0.5; done
+    if ! grep -q READY $WORK/out.$GPU; then
+        cat $WORK/out.$GPU; echo "FAIL: test_gpuid did not become ready"; RC=1; wait $PID; continue
+    fi
+    sleep 1
+    echo "--- nvidia-smi ---"; nvidia-smi
+    smi_procs > $WORK/procs
+    ON_TARGET=$(awk -v p=$PID -v g=$GPU '$1==p && $2==g {print $3}' $WORK/procs)
+    ELSEWHERE=$(awk -v p=$PID -v g=$GPU '$1==p && $2!=g {print $2 ":" $3 "MiB"}' $WORK/procs)
+    echo "pid $PID: ${ON_TARGET:-0} MiB on GPU $GPU (need >= $MIN_MIB), elsewhere: ${ELSEWHERE:-none}"
+    if [ -z "$ON_TARGET" ] || [ "$ON_TARGET" -lt "$MIN_MIB" ]; then
+        echo "FAIL: GPU buffer not found on GPU $GPU"; RC=1
+    fi
+    if [ -n "$ELSEWHERE" ]; then
+        echo "FAIL: process also holds memory on other GPU(s): $ELSEWHERE"; RC=1
+    fi
+    wait $PID || { echo "FAIL: test_gpuid exited with error"; cat $WORK/out.$GPU; RC=1; }
+done
+
+rm -rf $WORK $SCRATCH $PERSISTENT $META
+[ $RC -eq 0 ] && echo "test_gpuid: PASSED" || echo "test_gpuid: FAILED"
+exit $RC

@@ -1,0 +1,90 @@
+#!/bin/bash
+# Runs all GPU-support unit tests and prints a colored PASS/FAIL/SKIP summary.
+#
+# Usage: run_gpu_support_unit_tests.sh [build_dir] [-v]
+#   build_dir  VELOC build directory (default: the build tree this script was generated in)
+#   -v         also stream each test's full output
+# Env: EXTRA_LIBS  colon-separated extra library dirs (default: er and AXL installs next to the repo)
+
+REPO_ROOT=@CMAKE_SOURCE_DIR@
+BUILD_DIR=@CMAKE_BINARY_DIR@
+VERBOSE=0
+for a in "$@"; do
+    case "$a" in -v) VERBOSE=1 ;; *) BUILD_DIR=$(cd "$a" && pwd) ;; esac
+done
+TEST_DIR=$BUILD_DIR/test  # generated test scripts live here
+
+if [ -t 1 ]; then
+    RED=$'\e[1;31m'; GREEN=$'\e[1;32m'; YELLOW=$'\e[1;33m'; BLUE=$'\e[1;34m'; BOLD=$'\e[1m'; OFF=$'\e[0m'
+else
+    RED=; GREEN=; YELLOW=; BLUE=; BOLD=; OFF=
+fi
+
+EXTRA_LIBS=${EXTRA_LIBS:-$REPO_ROOT/../er/install/lib:$REPO_ROOT/AXL/install/lib}
+export LD_LIBRARY_PATH=$EXTRA_LIBS:$LD_LIBRARY_PATH
+
+# name | description
+TESTS=(
+    "test_gpubufferinit|GPU buffer is created lazily, once, on first device Mem_protect"
+    "test_gpuid|GPU buffer lands on the GPU holding the app memory (nvidia-smi)"
+    "test_multigpu_alloc|each MPI rank's memory and buffer stay on GPU rank%ngpu (nvidia-smi)"
+    "test_ckpt_stall|checkpoint_mem application stall timing (device/host)"
+    "test_gpu_mpi|MPI checkpoint then restart with verification"
+)
+
+LOG_DIR=$(mktemp -d)
+trap 'rm -rf "$LOG_DIR"' EXIT
+declare -A STATUS
+
+if ! command -v nvidia-smi >/dev/null || ! nvidia-smi -L >/dev/null 2>&1; then
+    echo "${RED}No usable NVIDIA GPU found (nvidia-smi failed)${OFF}"; exit 1
+fi
+echo "${BOLD}VELOC GPU support unit tests${OFF}  (build: $BUILD_DIR, GPUs: $(nvidia-smi -L | wc -l))"
+echo
+
+for entry in "${TESTS[@]}"; do
+    name=${entry%%|*}; desc=${entry#*|}
+    script=$TEST_DIR/$name.sh
+    printf "%s[ RUN  ]%s %-22s %s\n" "$BLUE" "$OFF" "$name" "$desc"
+    if [ ! -x "$script" ]; then
+        STATUS[$name]="MISSING"
+        echo "${RED}[MISSING]${OFF} $script not built/configured (run cmake + make in $BUILD_DIR)"
+        continue
+    fi
+    start=$SECONDS
+    if [ $VERBOSE -eq 1 ]; then
+        "$script" 2>&1 | tee "$LOG_DIR/$name.log"; rc=${PIPESTATUS[0]}
+    else
+        "$script" > "$LOG_DIR/$name.log" 2>&1; rc=$?
+    fi
+    t=$((SECONDS - start))
+    case $rc in
+        0)  STATUS[$name]="PASS"; echo "${GREEN}[ PASS ]${OFF} $name (${t}s)" ;;
+        77) STATUS[$name]="SKIP"; echo "${YELLOW}[ SKIP ]${OFF} $name (${t}s)" ;;
+        *)  STATUS[$name]="FAIL"; echo "${RED}[ FAIL ]${OFF} $name (exit $rc, ${t}s)"
+            if [ $VERBOSE -eq 0 ]; then
+                echo "${RED}--- last relevant output ---${OFF}"
+                grep -E "FAIL|MISMATCH|rror|rank [0-9]+ pid|pid [0-9]+:" "$LOG_DIR/$name.log" | tail -15 \
+                    | sed "s/^/    /"
+            fi ;;
+    esac
+    # stall numbers are informational: show them on pass too
+    if [ "$name" = test_ckpt_stall ] && [ "${STATUS[$name]}" = PASS ]; then
+        grep SUMMARY "$LOG_DIR/$name.log" | sed "s/^/    /"
+    fi
+done
+
+echo
+echo "${BOLD}==================== Summary ====================${OFF}"
+npass=0; nfail=0; nskip=0
+for entry in "${TESTS[@]}"; do
+    name=${entry%%|*}
+    case ${STATUS[$name]} in
+        PASS) echo "  ${GREEN}PASS${OFF}     $name"; npass=$((npass+1)) ;;
+        SKIP) echo "  ${YELLOW}SKIP${OFF}     $name"; nskip=$((nskip+1)) ;;
+        MISSING) echo "  ${RED}MISSING${OFF}  $name"; nfail=$((nfail+1)) ;;
+        *)    echo "  ${RED}FAIL${OFF}     $name"; nfail=$((nfail+1)) ;;
+    esac
+done
+echo "${BOLD}Total:${OFF} ${GREEN}$npass passed${OFF}, ${RED}$nfail failed${OFF}, ${YELLOW}$nskip skipped${OFF}"
+[ $nfail -eq 0 ]
