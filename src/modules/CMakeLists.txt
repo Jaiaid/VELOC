@@ -16,11 +16,19 @@ add_library (veloc-modules SHARED
   # unified transfer engine (host/device memory <-> file), shared by client and backend
   ${PROJECT_SOURCE_DIR}/src/common/file_provider.cpp
   ${PROJECT_SOURCE_DIR}/src/common/transfer_engine.cpp
+  # memory tiers (NUMA host nodes; GPUs added below when CUDA is available)
+  ${PROJECT_SOURCE_DIR}/src/common/tiers/mem_provider.cpp
+  ${PROJECT_SOURCE_DIR}/src/common/tiers/host_provider.cpp
 )
 
 add_library (veloc::modules ALIAS veloc-modules)
 
-target_link_libraries (veloc-modules PUBLIC MPI::MPI_CXX er::er OpenSSL::Crypto)
+find_library (NUMA_LIBRARY numa)
+if (NOT NUMA_LIBRARY)
+  message(FATAL_ERROR "libnuma not found: required for NUMA-aware host memory tiers")
+endif()
+
+target_link_libraries (veloc-modules PUBLIC MPI::MPI_CXX er::er OpenSSL::Crypto ${NUMA_LIBRARY})
 
 if (axl_FOUND)
   target_sources (veloc-modules PRIVATE  ${PROJECT_SOURCE_DIR}/src/storage/axl_module.cpp)
@@ -38,7 +46,7 @@ endif()
 
 # CUDA GPU staging provider (only compiled when CUDA is available)
 if (CUDAToolkit_FOUND)
-  target_sources (veloc-modules PRIVATE ${PROJECT_SOURCE_DIR}/src/common/gpu/cuda_provider.cpp)
+  target_sources (veloc-modules PRIVATE ${PROJECT_SOURCE_DIR}/src/common/tiers/cuda_provider.cpp)
   target_link_libraries (veloc-modules PUBLIC CUDA::cudart)
 endif()
 
