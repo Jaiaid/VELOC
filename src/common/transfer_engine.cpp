@@ -1,14 +1,16 @@
 #include "transfer_engine.hpp"
 #include "common/config.hpp"
 #include "file_provider.hpp"
-#include "common/gpu/gpu_provider.hpp"
+#include "common/tiers/mem_provider.hpp"
 
+#include <numa.h>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
 #include <vector>
 #include <algorithm>
+#include <map>
 #include <utility>
 #include <cstring>
 #include <cstdlib>
@@ -28,14 +30,27 @@
 #define VELOC_HOST_STAGE_SLOTS 16        // bounded pinned pool: SLOTS * CHUNK bytes
 #endif
 
-// Fallback factory when no GPU support is compiled in: everything is host memory.
+// Fallbacks when no GPU support is compiled in: everything is host memory.
 #ifndef WITH_CUDA
-gpu_provider_t *create_gpu_provider() { return nullptr; }
+int gpu_device_count() { return 0; }
+int gpu_device_of(const void *) { return -1; }
+gpu_provider_t *create_gpu_provider(int, size_t, int) { return nullptr; }
 #endif
 
 namespace {
 enum kind_t { K_HOST, K_DEVICE, K_FILE };
 struct dchunk_t { void *dev; int fd; size_t foff; size_t n; };
+
+// classify() result: T_FILE for file endpoints, otherwise the memory tier
+// (mem_dev_t) packed into an int as (type << 16 | id).
+const int T_FILE = -1;
+inline int encode_tier(mem_dev_t d) { return (d.type << 16) | (d.id & 0xffff); }
+inline mem_dev_t decode_tier(int t) { return mem_dev_t(t >> 16, t & 0xffff); }
+inline int kind_of(int t) {
+    if (t == T_FILE)
+        return K_FILE;
+    return decode_tier(t).type == DEV_GPU ? K_DEVICE : K_HOST;
+}
 }
 
 struct xfer_t { endpoint_t from, to; size_t len; };
@@ -60,48 +75,67 @@ struct xfer_group_impl_t {
 
 class transfer_engine_t::impl_t {
 private:
-    void init_host_tier(const config_t &cfg)
+    // Discover every memory tier on the node: one host_provider_t per NUMA node,
+    // then one gpu_provider_t per GPU. Only the providers are created here; their
+    // staging pools are allocated lazily by init_tiers_on_path().
+    void discover_tiers()
     {
         int num_host_stage_slots = VELOC_HOST_STAGE_SLOTS;
         cfg.get_optional<int>("host_stage_slots", num_host_stage_slots);
-        INFO(
-            "Initiating host staging pool: " << num_host_stage_slots << " slots of " << 
-            chunk << std::endl
-        );
+        int num_gpu_stage_slots = VELOC_GPU_STAGE_SLOTS;
+        cfg.get_optional<int>("per-gpu_stage_slots", num_gpu_stage_slots);
 
-        for (int i = 0; i < num_host_stage_slots; i++) {
-            void *s;
-            bool pinned;
-            if (gpu != nullptr) {
-                s = gpu->alloc_pinned(chunk);
-                pinned = (s != nullptr);
-                if (s == nullptr)
-                    s = ::malloc(chunk);
-                if (s == nullptr)
-                    break;
-            }
-            else {
-                s = ::malloc(chunk);
-                pinned = false;
-                if (s == nullptr)
-                    break;
-            }
-
-            slots_all.push_back(s);
-            slots_pinned.push_back(pinned);
-            free_slots.push_back(s);
+        if (numa_available() < 0) {
+            INFO("libnuma unavailable, using a single host tier");
+            tiers.push_back(new host_provider_t(0, chunk, num_host_stage_slots));
+        } else {
+            for (int n = 0; n <= numa_max_node(); n++)
+                if (numa_bitmask_isbitset(numa_all_nodes_ptr, n))
+                    tiers.push_back(new host_provider_t(n, chunk, num_host_stage_slots));
         }
+
+        int gpus = gpu_device_count();
+        for (int d = 0; d < gpus; d++) {
+            gpu_provider_t *gpu = create_gpu_provider(d, chunk, num_gpu_stage_slots);
+            if (gpu != nullptr)
+                tiers.push_back(gpu);
+        }
+        INFO(
+            "discovered " << tiers.size() - gpus << " NUMA host tier(s) and " << gpus << " GPU tier(s)" << std::endl
+        );
+    }
+
+    // NUMA node holding the page of ptr, or -1 if the page is not yet faulted in.
+    static int numa_node_of(const void *ptr) {
+        if (numa_available() < 0)
+            return 0;
+        void *page = (void *)((uintptr_t)ptr & ~((uintptr_t)numa_pagesize() - 1));
+        int status = -1;
+        if (numa_move_pages(0, 1, &page, nullptr, &status, 0) != 0 || status < 0)
+            return -1;
+        return status;
+    }
+
+    bool init_tier_buffer(mem_provider_t *t) {
+        if (t->buffer_initialized())
+            return true;
+        mem_dev_t d = t->get_device_type();
+        INFO(
+            "Initiating " << (d.type == DEV_GPU ? "device staging pool on GPU " : "host staging pool on NUMA node ") <<
+            d.id << ": " << t->slot_size() << " byte slots" << std::endl
+        );
+        if (!t->init_buffer()) {
+            ERROR("failed to initialize staging buffer on " << (d.type == DEV_GPU ? "GPU " : "NUMA node ") << d.id);
+            return false;
+        }
+        return true;
     }
 
 public:
-    gpu_provider_t *gpu = nullptr;
+    std::vector<mem_provider_t *> tiers; // every memory tier on the node, host tiers first
     size_t chunk = VELOC_XFER_CHUNK;
 
     const config_t &cfg; // reference to the config object used to initialize different tiers of the transfer engine
-
-    std::vector<void *> slots_all;   // every allocated slot (for teardown)
-    std::vector<bool> slots_pinned;
-    std::vector<void *> free_slots;  // touched only by the worker thread
 
     std::mutex mtx;
     std::condition_variable app_cv;  // application waiters (wait_sources/wait_completion)
@@ -111,14 +145,11 @@ public:
     bool stop = false;
 
     impl_t(const config_t &cfg) : cfg(cfg) {
-        // We assume that host tier is always available, so we create the host pool in constructor rather then deferring. 
-        // The GPU tier is optional and will be created only if GPU support is compiled in and a device pointer is seen.
-        // it can be pinned or unpinned depending on whether GPU support is available and pinned memory allocation succeeds.
-        init_host_tier(cfg);
-        // we create GPU provider but the buffer allocation at GPU tier is deferred until the first device pointer is seen, 
-        // so that we can choose the right device for multi-GPU systems
-        // also if not GPU build, create_gpu_provider() will return nullptr and the GPU tier will be disabled
-        gpu = create_gpu_provider();
+        // All tiers are discovered up front, but no staging memory is allocated
+        // until a protected pointer needs a tier (see init_tiers_on_path()), so
+        // that unused NUMA nodes and GPUs cost nothing.
+        // If not a GPU build, gpu_device_count() returns 0 and only host tiers exist.
+        discover_tiers();
         worker = std::thread([this] { run(); });
     }
 
@@ -130,44 +161,61 @@ public:
         }
         if (worker.joinable())
             worker.join();
-        for (size_t i = 0; i < slots_all.size(); i++) {
-            if (slots_pinned[i])
-                gpu->free_pinned(slots_all[i]);
-            else
-                ::free(slots_all[i]);
-        }
-        delete gpu;
+        for (mem_provider_t *t : tiers)
+            delete t;
     }
 
-
+    // Returns T_FILE, or the encoded tier (see encode_tier()) the memory belongs to:
+    // the owning GPU for device memory, otherwise the NUMA node holding it.
     int classify(const endpoint_t &e) {
         if (e.fd >= 0)
-            return K_FILE;
-        if (gpu != nullptr && gpu->is_device(e.ptr))
-            return K_DEVICE;
-        return K_HOST;
+            return T_FILE;
+        int gpu_id = gpu_device_of(e.ptr);
+        if (gpu_id >= 0)
+            return encode_tier(mem_dev_t(DEV_GPU, gpu_id));
+        int node = numa_node_of(e.ptr);
+        if (node < 0) // untouched page: attribute to the first host tier
+            node = tiers.front()->get_device_type().id;
+        return encode_tier(mem_dev_t(DEV_CPU, node));
     }
 
-    // This method is kept public for deferred initialization of the GPU tier, since we need to know which device to use for multi-GPU systems.
-    // It is called from transfer_engine_t::init_tier() when a device pointer is seen for the first time.
+    // Search the tier list for the provider of device d, nullptr if none.
+    mem_provider_t *find_tier(mem_dev_t d) {
+        for (mem_provider_t *t : tiers)
+            if (t->get_device_type() == d)
+                return t;
+        return nullptr;
+    }
+
+    gpu_provider_t *find_gpu(int device_id) {
+        return static_cast<gpu_provider_t *>(find_tier(mem_dev_t(DEV_GPU, device_id)));
+    }
+
+    // Host tier used to stage data of the given GPU on its way to/from a file:
+    // the GPU's affiliated NUMA node, or the first host tier if that is unknown.
+    mem_provider_t *staging_host_of(const gpu_provider_t *gpu) {
+        mem_provider_t *host = find_tier(mem_dev_t(DEV_CPU, gpu->affiliated_numa_node()));
+        return host != nullptr ? host : tiers.front();
+    }
+
+    // This method is kept public for deferred initialization of the tiers, since only the
+    // protected pointer tells us which GPU / NUMA node will be used.
+    // It is called from transfer_engine_t::init_tier() on every mem_protect().
     // As we are using Pimpl Idiom pattern this is called inside transfer_engin_t::init_tier and needs to be public
-    // If the GPU tier is already initialized or not exist, this method does nothing.
-    void init_colocated_gpu_buffer(void *ptr) {
-        if (gpu == nullptr)
+    // Allocates the staging pools of every tier on the pointer's path to a file:
+    // a device pointer goes GPU pool -> affiliated NUMA host pool -> file, while a host
+    // pointer is written directly and needs no pool. Already initialized tiers are skipped.
+    void init_tiers_on_path(void *ptr) {
+        int t = classify(mem(ptr));
+        if (kind_of(t) != K_DEVICE)
             return;
-        if (classify(mem(ptr)) != K_DEVICE)
+        gpu_provider_t *gpu = find_gpu(decode_tier(t).id);
+        if (gpu == nullptr) {
+            ERROR("no tier for GPU " << decode_tier(t).id);
             return;
-        if (gpu->device_buffer_initialized())
-            return;
-        int num_gpu_stage_slots = VELOC_GPU_STAGE_SLOTS;
-        cfg.get_optional<int>("per-gpu_stage_slots", num_gpu_stage_slots);
-        int device_id = gpu->get_device_id(ptr);
-        INFO(
-            "Initiating device staging pool on GPU " << device_id << ": " << num_gpu_stage_slots <<
-            " slots of " << chunk << std::endl
-        );
-        if (!gpu->init_device_buffer(chunk, num_gpu_stage_slots, device_id))
-            ERROR("failed to initialize device staging buffer on GPU " << device_id);
+        }
+        init_tier_buffer(staging_host_of(gpu));
+        init_tier_buffer(gpu);
     }
 
     void ensure_queued_locked(const std::shared_ptr<xfer_group_impl_t> &g) {
@@ -208,15 +256,29 @@ public:
         }
     }
 
+    // All chunks must belong to the same GPU (process() groups them per GPU).
     void run_device_out(const std::shared_ptr<xfer_group_impl_t> &g, std::vector<dchunk_t> &chunks) {
         // Three-tier device->file drain. The application's device memory is
         // first snapshotted with a fast D2D into the device staging pool; when
         // that pool is full, the oldest device-staged chunk is evicted (D2H)
-        // into a pinned slot and the slot is reused; when the pinned pool is
-        // also full, the oldest pinned chunk is written to the file. This keeps
-        // the device pool "hot" (incoming chunks keep landing on-device) and
-        // guarantees the file is written in capture order, since pin_staged
-        // always holds strictly older data than dev_staged.
+        // into a pinned slot of the GPU's affiliated NUMA node and the slot is
+        // reused; when the pinned pool is also full, the oldest pinned chunk is
+        // written to the file. This keeps the device pool "hot" (incoming chunks
+        // keep landing on-device) and guarantees the file is written in capture
+        // order, since pin_staged always holds strictly older data than dev_staged.
+        gpu_provider_t *gpu = find_gpu(decode_tier(classify(mem(chunks.front().dev))).id);
+        if (gpu == nullptr) {
+            ERROR("no tier for GPU owning " << chunks.front().dev);
+            fail(g);
+            return;
+        }
+        mem_provider_t *host = staging_host_of(gpu);
+        if (!host->buffer_initialized()) {
+            ERROR("no host staging pool for GPU " << gpu->get_device_type().id << ", was the region protected?");
+            fail(g);
+            return;
+        }
+
         std::deque<std::pair<void *, dchunk_t>> dev_staged; // device slots holding app data
         std::deque<std::pair<void *, dchunk_t>> pin_staged; // pinned slots awaiting file write
 
@@ -224,28 +286,27 @@ public:
         // are not starved; data in these slots is not written to the file).
         auto release_all = [&]() {
             for (auto &p : dev_staged)
-                gpu->release_device_slot(p.first);
+                gpu->release_slot(p.first);
             dev_staged.clear();
             for (auto &p : pin_staged)
-                free_slots.push_back(p.first);
+                host->release_slot(p.first);
             pin_staged.clear();
         };
 
         // Evict the oldest device-staged chunk into a free pinned slot. The
         // device slot is released either way; returns false on copy failure.
         auto move_dev_to_pin = [&]() -> bool {
-            void *pin = free_slots.back();
-            free_slots.pop_back();
+            void *pin = host->acquire_slot();
             void *dev = dev_staged.front().first;
             if (!gpu->copy_d2h(pin, dev, dev_staged.front().second.n)) {
                 fail(g);
-                gpu->release_device_slot(dev);
-                free_slots.push_back(pin);
+                gpu->release_slot(dev);
+                host->release_slot(pin);
                 dev_staged.pop_front();
                 return false;
             }
             pin_staged.push_back({pin, dev_staged.front().second});
-            gpu->release_device_slot(dev);
+            gpu->release_slot(dev);
             dev_staged.pop_front();
             return true;
         };
@@ -258,18 +319,18 @@ public:
                 fail(g);
             else
                 add_progress(g, 0, c.n);
-            free_slots.push_back(pin);
+            host->release_slot(pin);
             pin_staged.pop_front();
         };
 
         size_t i = 0;
         while (i < chunks.size() && !g->failed) {
             const dchunk_t &c = chunks[i];
-            void *devptr = gpu->acquire_device_slot();
+            void *devptr = gpu->acquire_slot();
             if (devptr != nullptr) {
                 if (!gpu->copy_d2d(devptr, c.dev, c.n)) {
                     fail(g);
-                    gpu->release_device_slot(devptr);
+                    gpu->release_slot(devptr);
                     break;
                 }
                 add_progress(g, c.n, 0); // application device memory released
@@ -277,18 +338,17 @@ public:
                 i++;
                 continue;
             }
-            if (!dev_staged.empty() && !free_slots.empty()) {
+            if (!dev_staged.empty() && host->free_slots() > 0) {
                 if (!move_dev_to_pin()) // frees a device slot
                     break;
                 continue; // stage into the freed device slot
             }
-            if (!free_slots.empty()) {
+            if (host->free_slots() > 0) {
                 // No device pool in use (init failed): stage into pinned.
-                void *pin = free_slots.back();
-                free_slots.pop_back();
+                void *pin = host->acquire_slot();
                 if (!gpu->copy_d2h(pin, c.dev, c.n)) {
                     fail(g);
-                    free_slots.push_back(pin);
+                    host->release_slot(pin);
                     break;
                 }
                 add_progress(g, c.n, 0);
@@ -299,15 +359,13 @@ public:
             // Both pools exhausted: flush the oldest pinned chunk to make room.
             // We only free one pinned slot at a time, this is done so that iterations are faster 
             // if the pinned pool is not full, and to avoid starving the device pool if it is full. 
-            if (free_slots.empty()) {
-                drain_pin_to_file();
-            }
+            drain_pin_to_file();
         }
 
         // Flush remaining tiers to the file, oldest-first.
         while (!g->failed) {
             if (!dev_staged.empty()) {
-                if (free_slots.empty()) {
+                if (host->free_slots() == 0) {
                     if (pin_staged.empty()) {
                         ERROR("no pinned slot available when flushing device staging");
                         fail(g);
@@ -328,11 +386,12 @@ public:
     }
 
     void process(const std::shared_ptr<xfer_group_impl_t> &g) {
-        std::vector<dchunk_t> dev_out;
+        std::map<int, std::vector<dchunk_t>> dev_out; // per source GPU tier
         for (auto &t : g->transfers) {
             if (g->failed)
                 break;
-            int kf = classify(t.from), kt = classify(t.to);
+            int tf = classify(t.from), tt = classify(t.to);
+            int kf = kind_of(tf), kt = kind_of(tt);
             if (kf == K_HOST && kt == K_FILE) {
                 if (!file_provider::write_range(t.to.fd, t.to.off, t.from.ptr, t.len))
                     fail(g);
@@ -341,7 +400,7 @@ public:
             } else if (kf == K_DEVICE && kt == K_FILE) {
                 for (size_t o = 0; o < t.len; o += chunk) {
                     size_t n = std::min(chunk, t.len - o);
-                    dev_out.push_back({(char *)t.from.ptr + o, t.to.fd, t.to.off + o, n});
+                    dev_out[tf].push_back({(char *)t.from.ptr + o, t.to.fd, t.to.off + o, n});
                 }
             } else if (kf == K_FILE && kt == K_HOST) {
                 if (!file_provider::read_range(t.from.fd, t.from.off, t.to.ptr, t.len))
@@ -349,21 +408,22 @@ public:
                 else
                     add_progress(g, t.len, t.len);
             } else if (kf == K_FILE && kt == K_DEVICE) {
+                gpu_provider_t *gpu = find_gpu(decode_tier(tt).id);
+                mem_provider_t *host = gpu != nullptr ? staging_host_of(gpu) : nullptr;
                 for (size_t o = 0; o < t.len && !g->failed; o += chunk) {
                     size_t n = std::min(chunk, t.len - o);
-                    void *slot = free_slots.empty() ? nullptr : free_slots.back();
+                    void *slot = host != nullptr ? host->acquire_slot() : nullptr;
                     if (slot == nullptr) {
                         ERROR("no staging slot available for device restore");
                         fail(g);
                         break;
                     }
-                    free_slots.pop_back();
                     if (!file_provider::read_range(t.from.fd, t.from.off + o, slot, n) ||
                         !gpu->copy_h2d((char *)t.to.ptr + o, slot, n))
                         fail(g);
                     else
                         add_progress(g, n, n);
-                    free_slots.push_back(slot);
+                    host->release_slot(slot);
                 }
             } else if (kf == K_FILE && kt == K_FILE) {
                 if (!file_provider::copy_range(t.from.fd, t.from.off, t.to.fd, t.to.off, t.len))
@@ -378,8 +438,11 @@ public:
                 fail(g);
             }
         }
-        if (!g->failed && !dev_out.empty())
-            run_device_out(g, dev_out);
+        for (auto &d : dev_out) {
+            if (g->failed)
+                break;
+            run_device_out(g, d.second);
+        }
         finish(g);
     }
 
@@ -491,5 +554,5 @@ xfer_group_t transfer_engine_t::group() {
 }
 
 void transfer_engine_t::init_tier(void *ptr) {
-    pimpl->init_colocated_gpu_buffer(ptr);
+    pimpl->init_tiers_on_path(ptr);
 }

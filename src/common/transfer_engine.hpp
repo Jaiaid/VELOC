@@ -65,8 +65,8 @@ public:
     static transfer_engine_t &instance(const config_t &cfg);
     // Begin a new group of related transfers.
     xfer_group_t group();
-    // Classify ptr and, if it is a GPU device pointer, initialize the
-    // device-side staging buffer on the GPU owning it.
+    // Classify ptr and allocate the staging pools of the tiers on its path to a
+    // file (for a GPU pointer: that GPU's pool and its NUMA node's host pool).
     void init_tier(void *ptr);
 };
 
