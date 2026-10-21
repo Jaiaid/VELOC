@@ -8,7 +8,8 @@
 /*
     Measures how long VELOC_Checkpoint_mem() stalls the application, i.e. the
     time until the application memory has been captured (device D2D/D2H or host
-    copy). Flushing to the filesystem continues in the background; the time
+    copy). The memory is split into 3 protected regions holding random data; after
+    the timed loop the last checkpoint is restored and verified. Flushing to the filesystem continues in the background; the time
     that takes to drain is reported separately as Checkpoint_wait.
 
     Usage: test_ckpt_stall <cfg_file> <device|host> [size_MiB=1024] [iterations=5]
@@ -32,15 +33,11 @@ int main(int argc, char *argv[]) {
         return 2;
     }
 
-    void *buf = NULL;
-    if (on_device) {
-        CUDA_CHECK(cudaMalloc(&buf, bytes));
-        CUDA_CHECK(cudaMemset(buf, 0x11, bytes));
-    } else {
-        buf = malloc(bytes);
-        memset(buf, 0x11, bytes);
-    }
-    VELOC_Mem_protect(0, buf, bytes, 1);
+    std::vector<test_region_t> regs;
+    make_regions(regs, bytes, random_base_seed(), on_device ? REGIONS_ALL_DEVICE : REGIONS_ALL_HOST);
+    fill_all(regs);
+    for (auto &r : regs)
+        protect_region(r);
 
     double sum = 0, mn = 1e30, mx = 0;
     for (int i = 1; i <= iters; i++) {
@@ -67,7 +64,8 @@ int main(int argc, char *argv[]) {
     printf("SUMMARY mem_stall_avg=%.6f mem_stall_min=%.6f mem_stall_max=%.6f MiB=%zu type=%s avg. stall_MBps=%.6f\n",
            sum / iters, mn, mx, mib, on_device ? "device" : "host", sum > 0 ? (double)mib / (sum/iters): 0.0);
 
+    int rc = restart_and_verify(regs, "test_ckpt_stall", iters);
     VELOC_Finalize(1);
-    if (on_device) cudaFree(buf); else free(buf);
-    return 0;
+    free_regions(regs);
+    return rc;
 }

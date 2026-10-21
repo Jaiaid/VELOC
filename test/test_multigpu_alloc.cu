@@ -42,27 +42,27 @@ int main(int argc, char *argv[]) {
     }
 
     CUDA_CHECK(cudaSetDevice(dev));
-    void *d_data = NULL;
-    CUDA_CHECK(cudaMalloc(&d_data, bytes));
-    CUDA_CHECK(cudaMemset(d_data, rank + 1, bytes));
-    VELOC_Mem_protect(0, d_data, bytes, 1);
+    // several regions per rank (device + small host), random per-rank data
+    std::vector<test_region_t> regs;
+    make_regions(regs, bytes, random_base_seed(), REGIONS_MIXED);
+    fill_all(regs);
+    for (auto &r : regs)
+        protect_region(r);
 
     printf("RANK %d PID %d GPU %d READY\n", rank, (int)getpid(), dev);
     fflush(stdout);
     MPI_Barrier(MPI_COMM_WORLD);
     sleep(hold);
 
-    int rc = 0;
-    if (VELOC_Checkpoint("test_multigpu_alloc", 1) != VELOC_SUCCESS) {
-        printf("RANK %d: checkpoint failed\n", rank);
-        rc = 6;
-    }
-    VELOC_Checkpoint_wait();
+    // checkpoint, clobber, restart and verify the random data on every rank
+    int rc = checkpoint_restart_verify(regs, "test_multigpu_alloc", 1);
+    if (rc != 0)
+        printf("RANK %d: checkpoint/restart verification failed (%d)\n", rank, rc);
     int total_rc = 0;
     MPI_Allreduce(&rc, &total_rc, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
     VELOC_Finalize(1);
-    cudaFree(d_data);
+    free_regions(regs);
     MPI_Finalize();
     return total_rc;
 }

@@ -7,17 +7,17 @@
 #include "include/veloc.h"
 
 /*
-    MPI version of heatdis_gpu (see build/test/test_gpu.sh). Each rank owns a
-    device array on GPU (rank % num_gpus) plus a host iteration counter. Run it
-    twice with the same config: the first run checkpoints, the second run finds
-    the checkpoint, restarts and verifies the device contents on every rank.
+    MPI version of heatdis_gpu (see build/test/test_gpu.sh). Each rank owns
+    several protected regions (3 device regions on GPU rank % num_gpus plus a
+    host region) filled with random data, and a host iteration counter. Run it
+    twice with the same config and the same seed: the first run checkpoints, the
+    second run finds the checkpoint, restarts over clobbered regions and verifies
+    that every region on every rank got its random data back.
 
-    Usage: mpirun -np N test_gpu_mpi <cfg_file> [array_MiB=256]
+    Usage: mpirun -np N test_gpu_mpi <cfg_file> [array_MiB=256] [seed]
+    The seed (base of the per-rank, per-region patterns) must be identical in
+    both runs; test_gpu_mpi.sh generates a random one.
 */
-
-static double expected(size_t i, int iter, int rank) {
-    return (double)((i + (size_t)iter + (size_t)rank) % 7);
-}
 
 int main(int argc, char *argv[]) {
     MPI_Init(&argc, &argv);
@@ -25,11 +25,13 @@ int main(int argc, char *argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nranks);
     if (argc < 2) {
-        if (rank == 0) printf("Usage: %s <cfg_file> [array_MiB]\n", argv[0]);
+        if (rank == 0) printf("Usage: %s <cfg_file> [array_MiB] [seed]\n", argv[0]);
         MPI_Finalize();
         return 1;
     }
-    size_t n = ((argc > 2 ? strtoul(argv[2], NULL, 10) : 256UL) << 20) / sizeof(double);
+    size_t bytes = (argc > 2 ? strtoul(argv[2], NULL, 10) : 256UL) << 20;
+    uint64_t seed = argc > 3 ? strtoull(argv[3], NULL, 10) : 12345;
+    seed += (uint64_t)rank * 1000003ULL; // different data on every rank
 
     int ngpu = 0;
     CUDA_CHECK(cudaGetDeviceCount(&ngpu));
@@ -41,34 +43,24 @@ int main(int argc, char *argv[]) {
     }
 
     int iter = 0, rc = 0;
-    double *d_data = NULL;
-    double *h = (double *)malloc(n * sizeof(double));
-    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(double)));
-    VELOC_Mem_protect(0, &iter, 1, sizeof(int));
-    VELOC_Mem_protect(1, d_data, n, sizeof(double));
+    std::vector<test_region_t> regs;
+    make_regions(regs, bytes, seed, REGIONS_MIXED);
+    VELOC_Mem_protect(100, &iter, 1, sizeof(int));
+    for (auto &r : regs)
+        protect_region(r);
 
     int v = VELOC_Restart_test("test_gpu_mpi", 0);
     if (v > 0) {
         if (rank == 0) printf("Previous checkpoint found (version %d), restarting...\n", v);
-        if (VELOC_Restart("test_gpu_mpi", v) != VELOC_SUCCESS) {
-            printf("RANK %d: error restarting!\n", rank);
-            rc = 4;
-        } else {
-            CUDA_CHECK(cudaMemcpy(h, d_data, n * sizeof(double), cudaMemcpyDeviceToHost));
-            int ok = (iter == 3);
-            for (size_t i = 0; ok && i < n; i++)
-                if (h[i] != expected(i, iter, rank)) {
-                    printf("RANK %d: MISMATCH at %zu: got %f expected %f\n", rank, i, h[i], expected(i, iter, rank));
-                    ok = 0;
-                }
-            printf("RANK %d (GPU %d): restart verification %s (iter=%d)\n", rank, rank % ngpu, ok ? "OK" : "FAIL", iter);
-            rc = ok ? 0 : 5;
+        rc = restart_and_verify(regs, "test_gpu_mpi", v);
+        if (rc == 0 && iter != 3) {
+            printf("RANK %d: FAIL iteration counter is %d, expected 3\n", rank, iter);
+            rc = 5;
         }
+        printf("RANK %d (GPU %d): restart verification %s (iter=%d)\n", rank, rank % ngpu, rc ? "FAIL" : "OK", iter);
     } else {
         iter = 3;
-        for (size_t i = 0; i < n; i++)
-            h[i] = expected(i, iter, rank);
-        CUDA_CHECK(cudaMemcpy(d_data, h, n * sizeof(double), cudaMemcpyHostToDevice));
+        fill_all(regs);
         if (VELOC_Checkpoint("test_gpu_mpi", iter) != VELOC_SUCCESS) {
             printf("RANK %d: error checkpointing!\n", rank);
             rc = 6;
@@ -81,8 +73,7 @@ int main(int argc, char *argv[]) {
     int total_rc = 0;
     MPI_Allreduce(&rc, &total_rc, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     VELOC_Finalize(v > 0 ? 1 : 0);
-    cudaFree(d_data);
-    free(h);
+    free_regions(regs);
     MPI_Finalize();
     return total_rc;
 }

@@ -14,14 +14,17 @@ clean() { rm -rf $SCRATCH $PERSISTENT $META; mkdir -p $SCRATCH $PERSISTENT $META
 CFG=$TEST_DIR/gpu-sync.cfg
 NP=${NP:-2}
 ARRAY_MIB=${ARRAY_MIB:-256}
+# same random seed for both runs: the restart run regenerates the pattern to verify
+SEED=${SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d " ")}
+echo "pattern seed: $SEED"
 
 clean
 # first run does only checkpoint, second run does only restart + verify
 echo "running test_gpu_mpi ($NP ranks) for checkpoint"
-mpirun $MPI_OPT -np $NP $TEST_DIR/test_gpu_mpi $CFG $ARRAY_MIB || { echo "test_gpu_mpi: checkpoint run FAILED"; exit 1; }
+mpirun $MPI_OPT -np $NP $TEST_DIR/test_gpu_mpi $CFG $ARRAY_MIB $SEED || { echo "test_gpu_mpi: checkpoint run FAILED"; exit 1; }
 
 echo "recovering from checkpoint"
-mpirun $MPI_OPT -np $NP $TEST_DIR/test_gpu_mpi $CFG $ARRAY_MIB
+mpirun $MPI_OPT -np $NP $TEST_DIR/test_gpu_mpi $CFG $ARRAY_MIB $SEED
 EXIT_CODE=$?
 
 rm -rf $SCRATCH $PERSISTENT $META
