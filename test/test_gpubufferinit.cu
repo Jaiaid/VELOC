@@ -9,7 +9,9 @@
     VELOC_Mem_protect() of a device pointer:
       1. protecting a host region must NOT allocate device memory,
       2. protecting a device region must allocate ~ slots * chunk bytes on the GPU,
-      3. protecting a second device region must NOT allocate another buffer.
+      3. protecting more device regions must NOT allocate another buffer,
+      4. a checkpoint/restart of all regions (3 device + 1 host, random data) restores
+         the exact data.
     Free device memory is sampled with cudaMemGetInfo around each step.
 
     Usage: test_gpubufferinit <cfg_file> [gpu_id=0] [slots=8] [chunk_MiB=64]
@@ -28,7 +30,7 @@ int main(int argc, char *argv[]) {
     int slots = argc > 3 ? atoi(argv[3]) : 8;
     size_t chunk = (argc > 4 ? strtoul(argv[4], NULL, 10) : 64UL) * MiB;
     size_t expected = (size_t)slots * chunk;
-    const size_t app_bytes = 16 * MiB;
+    const size_t app_bytes = 96 * MiB; // total over the 3 device regions
     const size_t tol = 16 * MiB; // allocator granularity / context noise
 
     int ngpu = 0;
@@ -45,15 +47,15 @@ int main(int argc, char *argv[]) {
         return 2;
     }
 
-    char *h_data = (char *)malloc(app_bytes);
-    void *d_data = NULL, *d_data2 = NULL;
-    CUDA_CHECK(cudaMalloc(&d_data, app_bytes));
-    CUDA_CHECK(cudaMalloc(&d_data2, app_bytes));
+    uint64_t seed = random_base_seed();
+    printf("pattern seed: %llu\n", (unsigned long long)seed);
+    std::vector<test_region_t> regs; // [0..2] device, [3] host
+    make_regions(regs, app_bytes, seed, REGIONS_MIXED);
     int fail = 0;
 
     // 1. host region: no device buffer expected
     size_t f0 = device_free_bytes(dev);
-    VELOC_Mem_protect(0, h_data, app_bytes, 1);
+    protect_region(regs[3]);
     size_t f1 = device_free_bytes(dev);
     long host_delta = (long)f0 - (long)f1;
     printf("host protect:   device memory consumed = %ld MiB\n", host_delta / (long)MiB);
@@ -63,7 +65,7 @@ int main(int argc, char *argv[]) {
     }
 
     // 2. first device region: buffer expected
-    VELOC_Mem_protect(1, d_data, app_bytes, 1);
+    protect_region(regs[0]);
     size_t f2 = device_free_bytes(dev);
     long dev_delta = (long)f1 - (long)f2;
     printf("device protect: device memory consumed = %ld MiB (expected ~%zu MiB)\n",
@@ -73,20 +75,24 @@ int main(int argc, char *argv[]) {
         fail = 1;
     }
 
-    // 3. second device region: buffer must be reused
-    VELOC_Mem_protect(2, d_data2, app_bytes, 1);
+    // 3. more device regions: buffer must be reused
+    protect_region(regs[1]);
+    protect_region(regs[2]);
     size_t f3 = device_free_bytes(dev);
     long again_delta = (long)f2 - (long)f3;
-    printf("2nd device protect: device memory consumed = %ld MiB\n", again_delta / (long)MiB);
+    printf("2 more device protects: device memory consumed = %ld MiB\n", again_delta / (long)MiB);
     if (again_delta > (long)tol) {
         printf("FAIL: GPU buffer was created more than once\n");
         fail = 1;
     }
 
+    // 4. random data round trip over all regions
+    fill_all(regs);
+    if (checkpoint_restart_verify(regs, "test_gpubufferinit", 1) != 0)
+        fail = 1;
+
     VELOC_Finalize(1);
-    cudaFree(d_data);
-    cudaFree(d_data2);
-    free(h_data);
+    free_regions(regs);
     printf("test_gpubufferinit: %s\n", fail ? "FAILED" : "PASSED");
     return fail;
 }
