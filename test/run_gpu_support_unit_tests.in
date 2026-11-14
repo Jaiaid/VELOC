@@ -30,6 +30,7 @@ TESTS=(
     "test_multigpu_alloc|each MPI rank's memory and buffer stay on GPU rank%ngpu (nvidia-smi)"
     "test_ckpt_stall|checkpoint_mem application stall timing (device/host)"
     "test_gpu_mpi|MPI checkpoint then restart with verification"
+    "test_gpu_snapshot|Checkpoint_mem returns only once the device snapshot is complete"
 )
 
 LOG_DIR=$(mktemp -d)

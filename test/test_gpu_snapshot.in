@@ -1,0 +1,26 @@
+#!/bin/bash
+# Checkpoint_mem must not return before the device snapshot is complete.
+
+LIB_DIR=@CMAKE_INSTALL_FULL_LIBDIR@
+BIN_DIR=@CMAKE_INSTALL_FULL_BINDIR@
+TEST_DIR=@CMAKE_CURRENT_BINARY_DIR@
+SCRATCH=@CMAKE_TEST_SCRATCH@
+PERSISTENT=@CMAKE_TEST_PERSISTENT@
+META=@CMAKE_TEST_META@
+
+export LD_LIBRARY_PATH=$LIB_DIR:$LD_LIBRARY_PATH
+export VELOC_BIN=$BIN_DIR
+clean() { rm -rf $SCRATCH $PERSISTENT $META; mkdir -p $SCRATCH $PERSISTENT $META; }
+
+RC=0
+for MODE in sync async; do
+    clean
+    $TEST_DIR/test_gpu_snapshot $TEST_DIR/gpu-$MODE.cfg ${MIB:-256} ${SPIN_MS:-300} 2>&1 | grep -v "^written "
+    code=${PIPESTATUS[0]}
+    [ $code -eq 77 ] && exit 77
+    if [ $code -eq 0 ]; then echo "PASS  $MODE"; else echo "FAIL  $MODE (exit $code)"; RC=1; fi
+    killall -q veloc-backend
+done
+rm -rf $SCRATCH $PERSISTENT $META
+[ $RC -eq 0 ] && echo "test_gpu_snapshot: PASSED" || echo "test_gpu_snapshot: FAILED"
+exit $RC
