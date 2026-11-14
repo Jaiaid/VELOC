@@ -1,0 +1,58 @@
+#!/bin/bash
+# Checkpoint completion semantics (host memory only, see test_ckpt_semantics.cpp).
+
+LIB_DIR=@CMAKE_INSTALL_FULL_LIBDIR@
+BIN_DIR=@CMAKE_INSTALL_FULL_BINDIR@
+TEST_DIR=@CMAKE_CURRENT_BINARY_DIR@
+SCRATCH=@CMAKE_TEST_SCRATCH@
+PERSISTENT=@CMAKE_TEST_PERSISTENT@
+META=@CMAKE_TEST_META@
+
+export LD_LIBRARY_PATH=$LIB_DIR:$LD_LIBRARY_PATH
+export VELOC_BIN=$BIN_DIR
+BIN=$TEST_DIR/test_ckpt_semantics
+ITERS=${ITERS:-500}
+RC=0
+
+clean() { rm -rf $SCRATCH $PERSISTENT $META; mkdir -p $SCRATCH $PERSISTENT $META; }
+stop_backend() { killall -q veloc-backend; sleep 1; }
+# run <label> <cfg> <case> [iters]: prints the outcome, records failures
+run() {
+    local label=$1; shift
+    OUT=$("$BIN" "$@" 2>&1); local code=$?
+    if [ $code -eq 0 ]; then echo "PASS  $label"
+    elif [ $code -eq 77 ]; then echo "SKIP  $label"
+    else echo "$OUT" | grep -v "^written " | tail -20; echo "FAIL  $label (exit $code)"; RC=1; fi
+    return $code
+}
+
+for MODE in sync async; do
+    CFG=$TEST_DIR/ckpt-semantics-$MODE.cfg
+    echo "== $MODE mode"
+
+    stop_backend; clean
+    run "$MODE: failed checkpoint is not sent to the backend" $CFG fail_not_flushed
+    [ $MODE = sync ] && continue
+
+    stop_backend; clean
+    if run "async: Route_file checkpoints are handed to the backend" $CFG route_file; then
+        rm -rf $SCRATCH; mkdir -p $SCRATCH
+        run "async: Route_file checkpoint restorable from persistent" $CFG route_file_verify
+    fi
+
+    stop_backend; clean
+    if run "async: Finalize(0) mid-drain does not crash" $CFG finalize_nodrain; then
+        # a new client's Init waits for the backend to process the previous commands
+        "$BIN" $CFG drain >/dev/null 2>&1
+        rm -rf $SCRATCH; mkdir -p $SCRATCH
+        run "async: checkpoint survives Finalize(0)" $CFG finalize_verify
+    fi
+
+    stop_backend; clean
+    run "async: Checkpoint_finished holds after Checkpoint_wait ($ITERS iterations)" $CFG wait_finished $ITERS ${RACE_MIB:-1}
+done
+
+stop_backend
+rm -rf $SCRATCH $PERSISTENT $META
+[ $RC -eq 0 ] && echo "test_ckpt_semantics: PASSED" || echo "test_ckpt_semantics: FAILED"
+exit $RC
