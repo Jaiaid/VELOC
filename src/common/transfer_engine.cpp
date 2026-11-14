@@ -63,8 +63,10 @@ struct xfer_group_impl_t {
 
     size_t src_total = 0, src_done = 0;
     size_t all_total = 0, all_done = 0;
+    // completion_ran: finish() has taken the completion (set or not);
+    // work_done: the completion has returned
     bool queued = false, work_done = false, completion_ran = false, failed = false;
-    std::function<void()> completion;
+    std::function<void(bool ok)> completion;
 
     ~xfer_group_impl_t() {
         for (int fd : fds)
@@ -154,6 +156,12 @@ public:
     }
 
     ~impl_t() {
+        teardown();
+    }
+
+    // Idempotent. The worker exits only once "ready" is empty, so every queued
+    // group is finished (and its completion has returned) before the join.
+    void teardown() {
         {
             std::unique_lock<std::mutex> lk(mtx);
             stop = true;
@@ -163,6 +171,7 @@ public:
             worker.join();
         for (mem_provider_t *t : tiers)
             delete t;
+        tiers.clear();
     }
 
     // Returns T_FILE, or the encoded tier (see encode_tier()) the memory belongs to:
@@ -328,7 +337,9 @@ public:
             const dchunk_t &c = chunks[i];
             void *devptr = gpu->acquire_slot();
             if (devptr != nullptr) {
-                if (!gpu->copy_d2d(devptr, c.dev, c.n)) {
+                // a D2D cudaMemcpy returns before the copy is done: wait for it
+                // before releasing the application memory
+                if (!gpu->copy_d2d(devptr, c.dev, c.n) || !gpu->synchronize()) {
                     fail(g);
                     gpu->release_slot(devptr);
                     break;
@@ -447,24 +458,24 @@ public:
     }
 
     void finish(const std::shared_ptr<xfer_group_impl_t> &g) {
-        std::function<void()> cb;
+        std::function<void(bool)> cb;
         {
             std::unique_lock<std::mutex> lk(mtx);
             g->src_done = g->src_total; // ensure waiters wake even after an early failure
             g->all_done = g->all_total;
-            g->work_done = true;
             for (int fd : g->fds)
                 if (fd >= 0)
                     ::close(fd);
             g->fds.clear();
-            if (g->completion && !g->completion_ran) {
-                cb = g->completion;
-                g->completion_ran = true;
-            }
+            cb = std::move(g->completion);
+            g->completion_ran = true;
+            app_cv.notify_all();
         }
         if (cb)
-            cb();
+            cb(!g->failed);
+        // only now: wait_completion() must not return while the completion runs
         std::unique_lock<std::mutex> lk(mtx);
+        g->work_done = true;
         app_cv.notify_all();
     }
 };
@@ -505,36 +516,27 @@ bool xfer_group_t::wait_completion() {
     if (!g)
         return true;
     auto *e = g->eng;
-    std::function<void()> cb;
-    {
-        std::unique_lock<std::mutex> lk(e->mtx);
-        e->ensure_queued_locked(g);
-        e->app_cv.wait(lk, [&] { return g->work_done; });
-        if (g->completion && !g->completion_ran) {
-            cb = g->completion;
-            g->completion_ran = true;
-        }
-    }
-    if (cb)
-        cb();
+    std::unique_lock<std::mutex> lk(e->mtx);
+    e->ensure_queued_locked(g);
+    e->app_cv.wait(lk, [&] { return g->work_done; });
     return !g->failed;
 }
 
-void xfer_group_t::on_completion(std::function<void()> cont) {
-    if (!g)
+void xfer_group_t::on_completion(std::function<void(bool ok)> cont) {
+    if (!g) { // nothing transferred (e.g. a file-based checkpoint)
+        cont(true);
         return;
-    auto *e = g->eng;
-    std::function<void()> run_now;
-    {
-        std::unique_lock<std::mutex> lk(e->mtx);
-        if (g->work_done && !g->completion_ran) {
-            g->completion_ran = true;
-            run_now = std::move(cont);
-        } else
-            g->completion = std::move(cont);
     }
-    if (run_now)
-        run_now();
+    bool ok;
+    {
+        std::unique_lock<std::mutex> lk(g->eng->mtx);
+        if (!g->completion_ran) {
+            g->completion = std::move(cont);
+            return;
+        }
+        ok = !g->failed;
+    }
+    cont(ok); // finish() already passed: run it now
 }
 
 // ---- transfer_engine_t -----------------------------------------------------
@@ -542,9 +544,22 @@ void xfer_group_t::on_completion(std::function<void()> cont) {
 transfer_engine_t::transfer_engine_t(const config_t &cfg) : pimpl(new impl_t(cfg)) { }
 transfer_engine_t::~transfer_engine_t() = default;
 
+static std::mutex engine_mtx;
+static std::unique_ptr<transfer_engine_t> engine;
+
 transfer_engine_t &transfer_engine_t::instance(const config_t &cfg) {
-    static transfer_engine_t engine(cfg);
-    return engine;
+    std::lock_guard<std::mutex> lk(engine_mtx);
+    if (!engine)
+        engine.reset(new transfer_engine_t(cfg));
+    return *engine;
+}
+
+void transfer_engine_t::teardown() {
+    std::lock_guard<std::mutex> lk(engine_mtx);
+    if (engine) {
+        engine->pimpl->teardown();
+        engine.reset();
+    }
 }
 
 xfer_group_t transfer_engine_t::group() {

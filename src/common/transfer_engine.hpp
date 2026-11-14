@@ -46,9 +46,10 @@ public:
     bool wait_sources();
     // Block until every transfer is durable in its destination.
     bool wait_completion();
-    // Run "cont" on the progress thread once the group is durable (or now, if
-    // it already is). Used to hand a completed local checkpoint to the backend.
-    void on_completion(std::function<void()> cont);
+    // Run "cont(ok)" on the progress thread once the group is done, ok being
+    // false if any transfer failed (or now, if it is already done or empty).
+    // wait_completion() returns only after "cont" has returned.
+    void on_completion(std::function<void(bool ok)> cont);
 };
 
 class transfer_engine_t {
@@ -63,6 +64,9 @@ public:
     ~transfer_engine_t();
     // Process-wide singleton (one engine, one progress thread per process).
     static transfer_engine_t &instance(const config_t &cfg);
+    // Finish every queued group (running its completion), stop the progress
+    // thread and free the staging pools. The next instance() creates a new engine.
+    static void teardown();
     // Begin a new group of related transfers.
     xfer_group_t group();
     // Classify ptr and allocate the staging pools of the tiers on its path to a
