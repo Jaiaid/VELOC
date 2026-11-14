@@ -10,7 +10,9 @@
     lazily creates the GPU staging buffer) and then sleeps so that an external
     observer (test_gpuid.sh, via nvidia-smi) can verify that this process holds
     GPU memory on that GPU only. Also checkpoints, to show the buffer works on
-    that GPU.
+    that GPU. The application memory is split in several regions (device + a small
+    host one) filled with random data; after the hold, the checkpoint is restored
+    over clobbered regions and compared with the pattern.
 
     Usage: test_gpuid <cfg_file> <gpu_id> [hold_seconds=10] [app_MiB=256]
     Prints "PID <pid> GPU <gpu_id> READY" once the buffer exists.
@@ -37,21 +39,18 @@ int main(int argc, char *argv[]) {
     }
 
     CUDA_CHECK(cudaSetDevice(dev));
-    void *d_data = NULL;
-    CUDA_CHECK(cudaMalloc(&d_data, bytes));
-    CUDA_CHECK(cudaMemset(d_data, 0x5a, bytes));
-    VELOC_Mem_protect(0, d_data, bytes, 1);
+    std::vector<test_region_t> regs;
+    make_regions(regs, bytes, random_base_seed(), REGIONS_MIXED);
+    fill_all(regs);
+    for (auto &r : regs)
+        protect_region(r);
 
     printf("PID %d GPU %d READY\n", (int)getpid(), dev);
     fflush(stdout);
     sleep(hold);
 
-    if (VELOC_Checkpoint("test_gpuid", 1) != VELOC_SUCCESS) {
-        printf("Error checkpointing!\n");
-        return 6;
-    }
-    VELOC_Checkpoint_wait();
+    int rc = checkpoint_restart_verify(regs, "test_gpuid", 1);
     VELOC_Finalize(1);
-    cudaFree(d_data);
-    return 0;
+    free_regions(regs);
+    return rc;
 }

@@ -23,6 +23,8 @@
         }                                                                    \
     } while (0)
 
+#define NUM_OF_REGIONS 10
+
 static inline double now_sec() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -54,9 +56,9 @@ struct test_region_t {
 };
 
 enum region_mix_t {
-    REGIONS_MIXED,       // 3 device regions (1:2:3 split of total) + one 8 MiB host region
-    REGIONS_ALL_DEVICE,  // 3 device regions
-    REGIONS_ALL_HOST     // 3 host regions
+    REGIONS_MIXED,       // NUM_OF_REGIONS device regions + one 8 MiB host region
+    REGIONS_ALL_DEVICE,  // NUM_OF_REGIONS device regions
+    REGIONS_ALL_HOST     // NUM_OF_REGIONS host regions
 };
 
 struct pattern_rng_t {
@@ -89,12 +91,19 @@ static inline uint64_t random_base_seed() {
     return ((uint64_t)rd() << 32) ^ rd();
 }
 
-// allocates (not yet protected) regions of about total_bytes of "bulk" memory
+// allocates (not yet protected) regions totalling total_bytes of "bulk" memory.
+// Region i gets a share proportional to i+1 (1:2:...:NUM_OF_REGIONS), so sizes
+// differ and do not line up with the staging chunk size; the last region takes
+// the rounding remainder.
 static inline void make_regions(std::vector<test_region_t> &regs, size_t total_bytes,
                                 uint64_t base_seed, region_mix_t mix) {
-    size_t unit = total_bytes / 6;
-    size_t sizes[3] = {unit, 2 * unit, total_bytes - 3 * unit};
-    for (int i = 0; i < 3; i++) {
+    const size_t parts = NUM_OF_REGIONS * (NUM_OF_REGIONS + 1) / 2;
+    size_t sizes[NUM_OF_REGIONS], used = 0;
+    for (int i = 0; i < NUM_OF_REGIONS; i++) {
+        sizes[i] = i + 1 < NUM_OF_REGIONS ? total_bytes / parts * (i + 1) : total_bytes - used;
+        used += sizes[i];
+    }
+    for (int i = 0; i < NUM_OF_REGIONS; i++) {
         test_region_t r = {i, NULL, sizes[i], mix != REGIONS_ALL_HOST, base_seed + 1 + i};
         if (r.device)
             CUDA_CHECK(cudaMalloc(&r.ptr, r.bytes));
@@ -103,7 +112,7 @@ static inline void make_regions(std::vector<test_region_t> &regs, size_t total_b
         regs.push_back(r);
     }
     if (mix == REGIONS_MIXED) {
-        test_region_t h = {3, malloc(8UL << 20), 8UL << 20, false, base_seed + 100};
+        test_region_t h = {NUM_OF_REGIONS, malloc(8UL << 20), 8UL << 20, false, base_seed + 100};
         regs.push_back(h);
     }
 }

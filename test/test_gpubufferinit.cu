@@ -49,13 +49,13 @@ int main(int argc, char *argv[]) {
 
     uint64_t seed = random_base_seed();
     printf("pattern seed: %llu\n", (unsigned long long)seed);
-    std::vector<test_region_t> regs; // [0..2] device, [3] host
+    std::vector<test_region_t> regs; // [0..n-2] device, [n-1] host
     make_regions(regs, app_bytes, seed, REGIONS_MIXED);
     int fail = 0;
 
     // 1. host region: no device buffer expected
     size_t f0 = device_free_bytes(dev);
-    protect_region(regs[3]);
+    protect_region(regs.back());
     size_t f1 = device_free_bytes(dev);
     long host_delta = (long)f0 - (long)f1;
     printf("host protect:   device memory consumed = %ld MiB\n", host_delta / (long)MiB);
@@ -76,8 +76,8 @@ int main(int argc, char *argv[]) {
     }
 
     // 3. more device regions: buffer must be reused
-    protect_region(regs[1]);
-    protect_region(regs[2]);
+    for (size_t i = 1; i + 1 < regs.size(); i++)
+        protect_region(regs[i]);
     size_t f3 = device_free_bytes(dev);
     long again_delta = (long)f2 - (long)f3;
     printf("2 more device protects: device memory consumed = %ld MiB\n", again_delta / (long)MiB);
