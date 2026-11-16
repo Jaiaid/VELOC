@@ -102,6 +102,12 @@ public:
         cudaSetDevice(gpu_id());
         return cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice) == cudaSuccess;
     }
+
+    // Copies are issued on the legacy default stream.
+    bool synchronize() override {
+        cudaSetDevice(gpu_id());
+        return cudaStreamSynchronize(0) == cudaSuccess;
+    }
 };
 
 } // anonymous namespace

@@ -51,6 +51,11 @@ public:
     void release_slot(void *ptr);
     size_t free_slots() const;
 
+    // Block until every copy issued on this tier has completed, and report any
+    // error raised while executing them. Host copies are complete on return, so
+    // this is a no-op for host tiers.
+    virtual bool synchronize() { return true; }
+
     virtual ~mem_provider_t();
 };
 
@@ -82,7 +87,9 @@ public:
     virtual bool copy_d2h(void *host_dst, const void *dev_src, size_t size) = 0;
     virtual bool copy_h2d(void *dev_dst, const void *host_src, size_t size) = 0;
 
-    // Blocking device<->device copy within the same GPU.
+    // Device<->device copy within the GPUs. NOT complete on return (CUDA
+    // does not synchronize the host for D2D copies): call synchronize() before
+    // relying on the destination or reusing the source.
     virtual bool copy_d2d(void *dst, const void *src, size_t size) = 0;
 
     // NUMA node the GPU is attached to (its host staging tier), -1 if unknown.
