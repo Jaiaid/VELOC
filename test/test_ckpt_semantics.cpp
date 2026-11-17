@@ -9,6 +9,7 @@
 
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 
 #include "include/veloc.h"
 
@@ -26,12 +27,16 @@
                         and must still hand the checkpoint to the backend.
       finalize_verify   Second phase of finalize_nodrain (scratch removed).
       drain             Only Init + Finalize(1): waits for earlier commands.
+      finished_after_flush  Poll Checkpoint_finished() without Checkpoint_wait():
+                        once it is true, the persistent copy must be complete
+                        (needs the persistent directory as 3rd argument).
       wait_finished     After Checkpoint_wait() succeeds, Checkpoint_finished()
                         must already be true (async). Probabilistic: many tiny
                         checkpoints to hit the window between "group done" and
                         "handed to backend".
 
     Usage: test_ckpt_semantics <cfg_file> <case> [iterations] [size_MiB]
+           test_ckpt_semantics <cfg_file> finished_after_flush <persistent_dir>
     Exit: 0 pass, 1 invariant violated, 2 setup error, 77 not applicable.
 */
 
@@ -236,6 +241,46 @@ static int case_wait_finished(bool async, int iters, size_t bytes) {
     return 0;
 }
 
+// Checkpoint_finished() means "no longer happening on the backend": it must
+// not turn true once the local stage is done but the flush is still running.
+static int case_finished_after_flush(bool async, const char *persistent) {
+    if (!async) {
+        printf("finished_after_flush applies to async mode only\n");
+        return 77;
+    }
+    std::vector<unsigned char> buf(8 * REGION_BYTES); // flush takes long enough to poll
+    SETUP(VELOC_Mem_protect(0, buf.data(), buf.size(), 1));
+    fill(buf.data(), buf.size(), 9);
+    SETUP(VELOC_Checkpoint_begin(NAME_MEM, 1));
+    SETUP(VELOC_Checkpoint_mem());
+    SETUP(VELOC_Checkpoint_end(1));
+
+    auto t0 = std::chrono::steady_clock::now();
+    while (VELOC_Checkpoint_finished() != VELOC_SUCCESS) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60))
+            FAIL("Checkpoint_finished still false after 60 s");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // the persistent copy must be complete right now, not eventually
+    const size_t header = sizeof(size_t) + sizeof(int) + sizeof(size_t);
+    std::string fname = std::string(persistent) + "/" + NAME_MEM + "-0-1.dat";
+    struct stat st;
+    if (stat(fname.c_str(), &st) != 0)
+        FAIL("Checkpoint_finished true but %s does not exist yet", fname.c_str());
+    if ((size_t)st.st_size != header + buf.size())
+        FAIL("Checkpoint_finished true but %s has %zu of %zu bytes (backend still flushing)",
+             fname.c_str(), (size_t)st.st_size, header + buf.size());
+    std::vector<unsigned char> data(buf.size());
+    FILE *f = fopen(fname.c_str(), "rb");
+    bool ok = f != NULL && fseek(f, header, SEEK_SET) == 0 && fread(data.data(), 1, data.size(), f) == data.size();
+    if (f) fclose(f);
+    if (!ok || !matches(data.data(), data.size(), 9))
+        FAIL("Checkpoint_finished true but the persistent content is not the checkpoint yet");
+    printf("Checkpoint_finished turned true only once the persistent copy was complete\n");
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         printf("Usage: %s <cfg_file> <case> [iterations] [size_MiB]\n", argv[0]);
@@ -258,6 +303,7 @@ int main(int argc, char *argv[]) {
     else if (c == "finalize_verify")   rc = case_finalize_verify();
     else if (c == "wait_finished")     rc = case_wait_finished(async, iters, (argc > 4 ? strtoul(argv[4], NULL, 10) : 1UL) << 20);
     else if (c == "drain")             rc = 0; // Init already waited for earlier commands
+    else if (c == "finished_after_flush") rc = argc > 3 ? case_finished_after_flush(async, argv[3]) : 2;
     else {
         printf("unknown case %s\n", c.c_str());
         rc = 2;

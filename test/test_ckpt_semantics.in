@@ -50,6 +50,9 @@ for MODE in sync async; do
 
     stop_backend; clean
     run "async: Checkpoint_finished holds after Checkpoint_wait ($ITERS iterations)" $CFG wait_finished $ITERS ${RACE_MIB:-1}
+
+    stop_backend; clean
+    run "async: Checkpoint_finished only once the backend flush is done" $CFG finished_after_flush $PERSISTENT
 done
 
 stop_backend
