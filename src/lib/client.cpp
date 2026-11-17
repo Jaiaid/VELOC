@@ -90,6 +90,9 @@ client_impl_t::client_impl_t(MPI_Comm c, const std::string &cfg_file) :
 }
 
 client_impl_t::~client_impl_t() {
+    // run the pending checkpoint's completion (uses "this" and "queue") and
+    // release the engine before anything it touches is destroyed
+    transfer_engine_t::teardown();
     if (local != MPI_COMM_NULL) {
         MPI_Barrier(local);
         MPI_Comm_free(&local);
@@ -135,9 +138,9 @@ bool client_impl_t::checkpoint_wait() {
     }
     // Drain the local (client-side) stage first; this also runs the deferred
     // backend enqueue registered in checkpoint_end().
-    if (!current_group.wait_completion())
-        return false;
-    return queue->wait_completion() == VELOC_SUCCESS;
+    bool ok = current_group.wait_completion();
+    current_group = xfer_group_t(); // report a failure once
+    return ok && queue->wait_completion() == VELOC_SUCCESS;
 }
 
 bool client_impl_t::checkpoint_finished() {
@@ -153,10 +156,11 @@ bool client_impl_t::checkpoint_finished() {
 }
 
 bool client_impl_t::checkpoint(const std::string &name, int version) {
-    return checkpoint_wait()
+    bool result = checkpoint_wait()
         && checkpoint_begin(name, version)
         && checkpoint_mem(VELOC_CKPT_ALL, {})
         && checkpoint_end(true);
+    return result;
 }
 
 bool client_impl_t::checkpoint_begin(const std::string &name, int version) {
@@ -171,6 +175,7 @@ bool client_impl_t::checkpoint_begin(const std::string &name, int version) {
 
     DBG("called checkpoint_begin");
     current_ckpt = command_t(rank, command_t::CHECKPOINT, version, name.c_str());
+    current_group = xfer_group_t(); // file-based checkpoints never set one
     checkpoint_in_progress = true;
     return true;
 }
@@ -291,18 +296,24 @@ bool client_impl_t::checkpoint_end(bool /*success*/) {
     };
 
     if (cfg.is_sync()) {
-        bool ok = current_group.wait_completion();
+        if (!current_group.wait_completion()) { // keep a failed checkpoint away from the backend and restart
+            remove(current_ckpt.filename(cfg.get("scratch")).c_str());
+            return false;
+        }
         queue->enqueue(current_ckpt);
         notify_observer();
-        return ok && queue->wait_completion() == VELOC_SUCCESS;
+        return queue->wait_completion() == VELOC_SUCCESS;
     }
 
     // Async: hand the checkpoint to the backend the moment the local file is
     // durable (on the engine progress thread), preserving compute/flush overlap.
     local_durable = false;
     command_t cmd = current_ckpt;
-    current_group.on_completion([this, cmd]() {
-        queue->enqueue(cmd);
+    current_group.on_completion([this, cmd](bool ok) {
+        if (ok)
+            queue->enqueue(cmd);
+        else // keep a failed checkpoint away from the backend and restart
+            remove(cmd.filename(cfg.get("scratch")).c_str());
         local_durable = true;
     });
     notify_observer();
@@ -339,9 +350,10 @@ std::string client_impl_t::route_file(const std::string &original) {
 }
 
 bool client_impl_t::restart(const std::string &name, int version, int target_rank) {
-    return restart_begin(name, version, target_rank)
+    bool result = restart_begin(name, version, target_rank)
         && recover_mem(VELOC_CKPT_ALL, {})
         && restart_end(true);
+    return result;
 }
 
 bool client_impl_t::restart_begin(const std::string &name, int version, int target_rank) {
